@@ -1,0 +1,49 @@
+# FastAPI Framework
+fastapi
+uvicorn[standard]
+python-multipart
+
+# MongoDB Async Driver (using PyMongo Async API instead of deprecated Motor)
+pymongo[srv]
+
+# Google Cloud & Gemini
+google-genai
+google-cloud-storage
+google-cloud-aiplatform
+
+# Data Validation & Settings
+pydantic
+pydantic-settings
+
+# Authentication & Security
+python-jose[cryptography]
+passlib[bcrypt]
+python-dotenv
+
+# WebSocket
+websockets
+python-socketio
+
+# Video Processing
+opencv-python-headless
+pillow
+
+# Utilities
+python-dateutil
+pytz
+
+# Monitoring & Logging
+structlog
+sentry-sdk[fastapi]
+
+# Testing
+pytest
+pytest-asyncio
+pytest-cov
+httpx
+
+# Development
+black
+flake8
+mypy
+pre-commit

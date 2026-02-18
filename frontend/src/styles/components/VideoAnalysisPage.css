@@ -1,0 +1,251 @@
+/* Video Analysis Page Styles */
+
+.video-analysis-container {
+  padding: 2rem 1rem;
+  max-width: 96rem;
+  margin: 0 auto;
+}
+
+.video-analysis-title {
+  font-size: 1.875rem;
+  font-weight: 700;
+  color: #111827;
+  margin-bottom: 2rem;
+}
+
+/* Input Section */
+.video-input-card {
+  background-color: #ffffff;
+  border-radius: 0.5rem;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);
+  padding: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+/* Results Section */
+.results-container {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+/* Procedure Overview */
+.procedure-overview {
+  background-color: #ffffff;
+  border-radius: 0.5rem;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);
+  padding: 1.5rem;
+}
+
+.procedure-overview-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: #111827;
+  margin-bottom: 1rem;
+}
+
+.procedure-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1rem;
+}
+
+@media (min-width: 768px) {
+  .procedure-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.procedure-info-item {
+  border-left: 4px solid #0284c7;
+  padding-left: 1rem;
+}
+
+.procedure-info-label {
+  font-size: 0.875rem;
+  color: #4b5563;
+  margin-bottom: 0.25rem;
+}
+
+.procedure-info-value {
+  font-size: 1.125rem;
+  font-weight: 500;
+  color: #111827;
+}
+
+.procedure-info-value.capitalize {
+  text-transform: capitalize;
+}
+
+.procedure-characteristics {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid #e5e7eb;
+}
+
+.procedure-characteristics-label {
+  font-size: 0.875rem;
+  color: #4b5563;
+  margin-bottom: 0.5rem;
+}
+
+.procedure-characteristics-text {
+  color: #111827;
+  line-height: 1.6;
+}
+
+/* Surgical Steps */
+.surgical-steps-section {
+  background-color: #ffffff;
+  border-radius: 0.5rem;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);
+  padding: 1.5rem;
+}
+
+.surgical-steps-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: #111827;
+  margin-bottom: 1rem;
+}
+
+.steps-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.step-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 0.5rem;
+  padding: 1rem;
+  transition: box-shadow 0.2s;
+}
+
+.step-card:hover {
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+}
+
+.step-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+
+.step-title-row {
+  display: flex;
+  align-items: center;
+}
+
+.step-number {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 50%;
+  background-color: #dbeafe;
+  color: #0369a1;
+  font-weight: 600;
+  margin-right: 0.75rem;
+  flex-shrink: 0;
+}
+
+.step-name {
+  font-size: 1.125rem;
+  font-weight: 600;
+  color: #111827;
+}
+
+.step-critical-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.25rem 0.75rem;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  background-color: #fee2e2;
+  color: #b91c1c;
+}
+
+.step-description {
+  color: #374151;
+  margin-bottom: 0.75rem;
+  margin-left: 2.75rem;
+  line-height: 1.6;
+}
+
+.step-metadata {
+  margin-left: 2.75rem;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1rem;
+  font-size: 0.875rem;
+}
+
+@media (min-width: 768px) {
+  .step-metadata {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.step-metadata-item {
+  color: #111827;
+}
+
+.step-metadata-label {
+  color: #4b5563;
+  font-weight: 500;
+}
+
+.step-metadata-value {
+  color: #111827;
+  margin-left: 0.5rem;
+}
+
+.step-section {
+  margin-left: 2.75rem;
+  margin-top: 0.75rem;
+}
+
+.step-section-label {
+  color: #4b5563;
+  font-weight: 500;
+  font-size: 0.875rem;
+  margin-bottom: 0.25rem;
+}
+
+.step-badges-container {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
+.step-badge-instrument {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.25rem;
+  background-color: #dbeafe;
+  color: #1e40af;
+  font-size: 0.75rem;
+}
+
+.step-badge-landmark {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.25rem;
+  background-color: #f3e8ff;
+  color: #7c3aed;
+  font-size: 0.75rem;
+}
+
+.step-visual-cues {
+  color: #374151;
+  font-size: 0.875rem;
+  margin-top: 0.25rem;
+  line-height: 1.5;
+}
