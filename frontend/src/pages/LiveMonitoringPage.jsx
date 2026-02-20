@@ -52,11 +52,26 @@ function LiveMonitoringPage() {
     setMessages(prev => [...prev, { type, text, timestamp: new Date().toLocaleTimeString() }]);
   };
 
-  const listAvailableCameras = async () => {
+  const listAvailableCameras = async (requestPermission = false) => {
     try {
-      // Only enumerate devices without requesting camera access
-      // This prevents auto-starting the camera on page load
-      const devices = await navigator.mediaDevices.enumerateDevices();
+      let devices;
+      
+      if (requestPermission) {
+        // Request camera permission to get actual device labels
+        addMessage('info', 'Requesting camera permission...');
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        // Stop the stream immediately - we only needed it for permission
+        stream.getTracks().forEach(track => track.stop());
+        
+        // Now enumerate with proper labels
+        devices = await navigator.mediaDevices.enumerateDevices();
+        addMessage('success', 'Camera access granted');
+      } else {
+        // Only enumerate devices without requesting camera access
+        // This prevents auto-starting the camera on page load
+        devices = await navigator.mediaDevices.enumerateDevices();
+      }
+      
       const videoInputs = devices.filter(device => device.kind === 'videoinput');
       setAvailableCameras(videoInputs);
 
@@ -64,12 +79,18 @@ function LiveMonitoringPage() {
         setSelectedCameraId(videoInputs[0].deviceId);
       }
       
-      // If no cameras found, might need permission first
-      if (videoInputs.length === 0 || !videoInputs[0].label) {
-        addMessage('info', 'Camera permission needed. Click "Start Video Stream" to grant access.');
+      // If no cameras found or no labels, suggest clicking refresh
+      if (videoInputs.length === 0) {
+        addMessage('error', 'No cameras detected. Please check your camera connection.');
+      } else if (!requestPermission && !videoInputs[0].label) {
+        addMessage('info', 'Click "Refresh" to see camera names (requires permission).');
       }
     } catch (error) {
-      addMessage('error', `Unable to list cameras: ${error.message}`);
+      if (error.name === 'NotAllowedError') {
+        addMessage('error', 'Camera permission denied. Please allow camera access and try again.');
+      } else {
+        addMessage('error', `Unable to list cameras: ${error.message}`);
+      }
     }
   };
 
@@ -261,7 +282,7 @@ function LiveMonitoringPage() {
                 </label>
                 <button
                   type="button"
-                  onClick={listAvailableCameras}
+                  onClick={() => listAvailableCameras(true)}
                   className="text-xs text-primary-600 hover:text-primary-700"
                   disabled={isStreaming}
                 >
