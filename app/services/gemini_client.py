@@ -255,6 +255,59 @@ class GeminiClient:
         
         return parsed_result
     
+    async def generate_content(
+        self,
+        prompt: str,
+        temperature: Optional[float] = None,
+        response_mime_type: str = "text/plain"
+    ) -> str:
+        """
+        Generate content from text-only prompt.
+        
+        Used for document parsing and text-based tasks.
+        
+        Args:
+            prompt: Text prompt
+            temperature: Model temperature
+            response_mime_type: Response format ("text/plain" or "application/json")
+            
+        Returns:
+            Generated content as string
+        """
+        try:
+            logger.info(
+                "generating_content",
+                prompt_length=len(prompt),
+                response_type=response_mime_type
+            )
+            
+            # Configure generation
+            config = GenerateContentConfig(
+                temperature=temperature if temperature is not None else self.temperature,
+                response_mime_type=response_mime_type
+            )
+            
+            # Generate content
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=config
+            )
+            
+            logger.info(
+                "content_generated",
+                response_length=len(response.text)
+            )
+            
+            return response.text
+            
+        except Exception as e:
+            logger.error(
+                "content_generation_failed",
+                error=str(e)
+            )
+            raise
+    
     async def analyze_frame(
         self,
         frame_data: bytes,

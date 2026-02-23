@@ -4,6 +4,7 @@ MongoDB collection names and indexes.
 
 # Collection names
 MASTER_PROCEDURES = "master_procedures"
+OUTLIER_PROCEDURES = "outlier_procedures"  # New: Outlier resolution-based procedures
 SURGICAL_STEPS = "surgical_steps"
 LIVE_SESSIONS = "live_sessions"
 SESSION_ALERTS = "session_alerts"
@@ -17,6 +18,12 @@ async def create_indexes(db):
     # Master Procedures indexes
     await db[MASTER_PROCEDURES].create_index("procedure_type")
     await db[MASTER_PROCEDURES].create_index("created_at")
+    
+    # Outlier Procedures indexes
+    await db[OUTLIER_PROCEDURES].create_index("procedure_type")
+    await db[OUTLIER_PROCEDURES].create_index("procedure_name")
+    await db[OUTLIER_PROCEDURES].create_index("version")
+    await db[OUTLIER_PROCEDURES].create_index("created_at")
     
     # Note: SURGICAL_STEPS collection is deprecated - steps are now embedded in master_procedures
     

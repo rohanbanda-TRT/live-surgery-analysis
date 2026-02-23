@@ -10,8 +10,9 @@ import cv2
 import numpy as np
 
 from app.services.gemini_client import GeminiClient
-from app.db.collections import MASTER_PROCEDURES, SURGICAL_STEPS, LIVE_SESSIONS, SESSION_ALERTS
+from app.db.collections import MASTER_PROCEDURES, SURGICAL_STEPS, LIVE_SESSIONS, SESSION_ALERTS, OUTLIER_PROCEDURES
 from app.core.logging import logger
+from app.prompts.surgical_analysis import get_outlier_chunk_analysis_prompt
 
 
 class LiveSurgeryService:
@@ -31,6 +32,8 @@ class LiveSurgeryService:
         
         # Session state
         self.master_procedure: Optional[Dict[str, Any]] = None
+        self.outlier_procedure: Optional[Dict[str, Any]] = None  # For outlier resolution mode
+        self.procedure_source: str = "standard"  # "standard" or "outlier"
         self.procedure_steps: List[Dict[str, Any]] = []
         self.current_step_index: int = 0
         self.session_doc_id: Optional[ObjectId] = None
@@ -45,6 +48,7 @@ class LiveSurgeryService:
         self.detected_steps_cumulative: set = set()  # Steps that have been detected (NEVER removed)
         self.step_status: Dict[int, str] = {}  # step_index -> status (pending/detected/missed)
         self.step_detection_history: Dict[int, List[str]] = {}  # step_index -> list of detection analyses
+        self.phase_number_to_index: Dict[str, int] = {}  # For outlier mode: phase_number -> index mapping
         
         # Video chunk processing
         self.frame_buffer: List[bytes] = []
@@ -61,6 +65,7 @@ class LiveSurgeryService:
         self,
         procedure_id: str,
         surgeon_id: str,
+        procedure_source: str = "standard",
         alert_callback: Optional[Callable] = None,
         analysis_callback: Optional[Callable] = None
     ):
@@ -68,8 +73,9 @@ class LiveSurgeryService:
         Start a new live surgery monitoring session.
         
         Args:
-            procedure_id: ID of the master procedure
+            procedure_id: ID of the master procedure or outlier procedure
             surgeon_id: ID of the surgeon
+            procedure_source: "standard" for master_procedures, "outlier" for outlier_procedures
             alert_callback: Callback for sending alerts
             analysis_callback: Callback for sending real-time analysis updates
         """
@@ -78,23 +84,70 @@ class LiveSurgeryService:
             self.is_processing_chunks = True
             self.chunk_task = asyncio.create_task(self._process_chunk_queue())
             
+            self.procedure_source = procedure_source
+            
             logger.info(
                 "starting_live_session",
                 session_id=self.session_id,
                 procedure_id=procedure_id,
-                surgeon_id=surgeon_id
+                surgeon_id=surgeon_id,
+                procedure_source=procedure_source
             )
             
-            # Load master procedure with embedded steps
-            self.master_procedure = await self.db[MASTER_PROCEDURES].find_one(
-                {"_id": ObjectId(procedure_id)}
-            )
-            
-            if not self.master_procedure:
-                raise ValueError(f"Master procedure {procedure_id} not found")
-            
-            # Get steps from embedded array
-            self.procedure_steps = self.master_procedure.get("steps", [])
+            # Load procedure based on source type
+            if procedure_source == "outlier":
+                # Load outlier resolution procedure
+                self.outlier_procedure = await self.db[OUTLIER_PROCEDURES].find_one(
+                    {"_id": ObjectId(procedure_id)}
+                )
+                
+                if not self.outlier_procedure:
+                    raise ValueError(f"Outlier procedure {procedure_id} not found")
+                
+                # Convert outlier phases to steps format for compatibility
+                # IMPORTANT: Use phase_number as the primary identifier, not sequential index
+                self.procedure_steps = [
+                    {
+                        "step_number": phase["phase_number"],  # Use actual phase number (3.1, 3.2, etc.)
+                        "step_name": phase["phase_name"],
+                        "description": phase["goal"],
+                        "is_critical": phase["priority"] == "HIGH",
+                        "phase_number": phase["phase_number"],
+                        "phase_index": i  # Keep index for array access
+                    }
+                    for i, phase in enumerate(self.outlier_procedure.get("phases", []))
+                ]
+                
+                # Create phase_number to index mapping for quick lookup
+                self.phase_number_to_index = {
+                    phase["phase_number"]: i 
+                    for i, phase in enumerate(self.outlier_procedure.get("phases", []))
+                }
+                
+                logger.info(
+                    "outlier_procedure_loaded",
+                    session_id=self.session_id,
+                    procedure_name=self.outlier_procedure.get("procedure_name"),
+                    phases_count=len(self.procedure_steps)
+                )
+            else:
+                # Load standard master procedure with embedded steps
+                self.master_procedure = await self.db[MASTER_PROCEDURES].find_one(
+                    {"_id": ObjectId(procedure_id)}
+                )
+                
+                if not self.master_procedure:
+                    raise ValueError(f"Master procedure {procedure_id} not found")
+                
+                # Get steps from embedded array
+                self.procedure_steps = self.master_procedure.get("steps", [])
+                
+                logger.info(
+                    "master_procedure_loaded",
+                    session_id=self.session_id,
+                    procedure_name=self.master_procedure.get("procedure_name"),
+                    steps_count=len(self.procedure_steps)
+                )
             
             # Initialize all steps as pending
             for i in range(len(self.procedure_steps)):
@@ -105,6 +158,11 @@ class LiveSurgeryService:
             self.step_detection_history.clear()
             
             # Create session document
+            procedure_name = (
+                self.outlier_procedure.get("procedure_name") if self.procedure_source == "outlier"
+                else self.master_procedure.get("procedure_name")
+            )
+            
             session_doc = {
                 "session_id": self.session_id,
                 "procedure_id": ObjectId(procedure_id),
@@ -113,8 +171,9 @@ class LiveSurgeryService:
                 "end_time": None,
                 "current_step": 0,
                 "status": "active",
+                "procedure_source": self.procedure_source,
                 "metadata": {
-                    "procedure_name": self.master_procedure.get("procedure_name"),
+                    "procedure_name": procedure_name,
                     "total_steps": len(self.procedure_steps)
                 }
             }
@@ -340,8 +399,28 @@ class LiveSurgeryService:
                     history_lines.append(f"  {matches}")
                 history_context = f"\n**Analysis History (Last {len(recent_history)} chunks):**\n" + "\n".join(history_lines) + "\n"
             
-            # Build detailed current step context from master procedure
-            current_step_detail = f"""
+            # Build prompt based on procedure source
+            if self.procedure_source == "outlier":
+                # Use outlier resolution prompt with error detection
+                remaining_phases = [
+                    phase for i, phase in enumerate(self.outlier_procedure.get('phases', []))
+                    if i not in self.detected_steps_cumulative
+                ]
+                
+                detected_phase_numbers = {
+                    self.procedure_steps[i].get('phase_number') 
+                    for i in self.detected_steps_cumulative
+                }
+                
+                prompt = get_outlier_chunk_analysis_prompt(
+                    outlier_procedure=self.outlier_procedure,
+                    detected_phases=detected_phase_numbers,
+                    remaining_phases=remaining_phases,
+                    chunk_history=self.chunk_history
+                )
+            else:
+                # Use standard prompt for master procedures
+                current_step_detail = f"""
 **Current Expected Step {current_step.get('step_number', self.current_step_index + 1)}: {current_step['step_name']}**
 - Description: {current_step.get('description', 'N/A')}
 - Expected Duration: {current_step.get('expected_duration_min', 'N/A')}-{current_step.get('expected_duration_max', 'N/A')} minutes
@@ -350,9 +429,10 @@ class LiveSurgeryService:
 - Anatomical Landmarks: {', '.join(current_step.get('anatomical_landmarks', [])) or 'Not specified'}
 - Visual Cues: {current_step.get('visual_cues', 'Not specified')}
 """
-            
-            # Enhanced prompt with master procedure alignment
-            prompt = f"""Analyze this {len(chunk_data['frames'])}-second surgical video clip from {self.master_procedure.get('procedure_name')}.
+                
+                procedure_name = self.master_procedure.get('procedure_name') if self.master_procedure else 'Unknown Procedure'
+                
+                prompt = f"""Analyze this {len(chunk_data['frames'])}-second surgical video clip from {procedure_name}.
 
 **MASTER PROCEDURE CONTEXT:**
 {current_step_detail}
@@ -434,8 +514,16 @@ Analyze the video clip and respond:"""
     ):
         """Process analysis response using cumulative step tracking (like reference implementation)."""
         try:
-            # Parse AI response
-            detected_step_index = self._parse_detected_step(analysis)
+            # Parse AI response differently for outlier vs standard mode
+            if self.procedure_source == "outlier":
+                # For outlier mode: parse phase_number (e.g., "3.4") from AI response
+                detected_phase_number = self._parse_detected_phase_number(analysis)
+                # Convert phase_number to index
+                detected_step_index = self.phase_number_to_index.get(detected_phase_number) if detected_phase_number else None
+            else:
+                # For standard mode: parse step index as before
+                detected_step_index = self._parse_detected_step(analysis)
+            
             matches_expected = "yes" in analysis.lower() and "matches expected: yes" in analysis.lower()
             step_progress = self._parse_step_progress(analysis)
             completion_evidence = self._parse_completion_evidence(analysis)
@@ -628,8 +716,13 @@ Analyze the video clip and respond:"""
             
             # Prepare detailed analysis prompt with completed steps awareness
             # IMPORTANT: This matches the strict Live API format for consistency
+            procedure_name = (
+                self.outlier_procedure.get('procedure_name') if self.procedure_source == "outlier"
+                else self.master_procedure.get('procedure_name')
+            )
+            
             prompt = f"""
-You are monitoring a live surgical procedure: {self.master_procedure.get('procedure_name')}
+You are monitoring a live surgical procedure: {procedure_name}
 
 **COMPLETED STEPS (DO NOT MATCH AGAINST THESE):**
 {completed_context}
@@ -910,6 +1003,27 @@ Analysis: [detailed observation - what is the surgeon doing RIGHT NOW?]
                 session_id=self.session_id,
                 error=str(e)
             )
+    
+    def _parse_detected_phase_number(self, analysis: str) -> Optional[str]:
+        """
+        Parse the detected phase number from AI analysis response (for outlier mode).
+        
+        Args:
+            analysis: AI analysis text
+            
+        Returns:
+            Phase number (e.g., "3.4") or None if not detected
+        """
+        try:
+            import re
+            # Look for "Detected Phase: [phase_number]" pattern
+            match = re.search(r'Detected Phase:\s*(\d+\.\d+)', analysis, re.IGNORECASE)
+            if match:
+                return match.group(1)
+            return None
+        except Exception as e:
+            logger.error("failed_to_parse_detected_phase", error=str(e))
+            return None
     
     def _parse_detected_step(self, analysis: str) -> Optional[int]:
         """

@@ -83,6 +83,10 @@ class SessionAlertResponse(BaseModel):
 class LiveSessionCreate(BaseModel):
     """Schema for creating live session."""
     procedure_id: str
+    procedure_source: str = Field(
+        default="standard",
+        description="Procedure source type: 'standard' for master_procedures, 'outlier' for outlier_procedures"
+    )
 
 
 class LiveSessionResponse(BaseModel):

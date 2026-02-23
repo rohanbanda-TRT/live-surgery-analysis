@@ -32,6 +32,21 @@ export const proceduresAPI = {
   },
 };
 
+// Outlier Procedures API (Error Resolution Protocols)
+export const outlierProceduresAPI = {
+  // Get all outlier procedures
+  getAll: async () => {
+    const response = await api.get('/api/outlier-procedures');
+    return response.data;
+  },
+
+  // Get single outlier procedure by ID
+  getById: async (id) => {
+    const response = await api.get(`/api/outlier-procedures/${id}`);
+    return response.data;
+  },
+};
+
 // Sessions API
 export const sessionsAPI = {
   // Get session alerts

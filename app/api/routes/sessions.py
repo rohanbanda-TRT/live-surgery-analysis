@@ -34,6 +34,7 @@ async def websocket_endpoint(
         init_data = await websocket.receive_json()
         procedure_id = init_data.get("procedure_id")
         surgeon_id = init_data.get("surgeon_id", "default-surgeon")
+        procedure_source = init_data.get("procedure_source", "standard")  # "standard" or "outlier"
         
         if not procedure_id:
             await websocket.send_json({"error": "procedure_id required"})
@@ -60,18 +61,43 @@ async def websocket_endpoint(
         await service.start_session(
             procedure_id=procedure_id,
             surgeon_id=surgeon_id,
+            procedure_source=procedure_source,
             alert_callback=send_alerts,
             analysis_callback=send_analysis_update
         )
         
-        await websocket.send_json({
-            "type": "session_started",
-            "data": {
+        # Build session started response based on procedure source
+        if procedure_source == "outlier":
+            if not service.outlier_procedure:
+                await websocket.send_json({"error": "Outlier procedure not found"})
+                await websocket.close()
+                return
+            
+            session_data = {
+                "procedure_name": service.outlier_procedure.get("procedure_name"),
+                "procedure_type": service.outlier_procedure.get("procedure_type"),
+                "procedure_source": "outlier",
+                "version": service.outlier_procedure.get("version"),
+                "total_steps": len(service.procedure_steps),
+                "steps": service.procedure_steps
+            }
+        else:
+            if not service.master_procedure:
+                await websocket.send_json({"error": "Master procedure not found"})
+                await websocket.close()
+                return
+            
+            session_data = {
                 "procedure_name": service.master_procedure.get("procedure_name"),
                 "procedure_type": service.master_procedure.get("procedure_type"),
+                "procedure_source": "standard",
                 "total_steps": len(service.master_procedure.get("steps", [])),
                 "steps": service.master_procedure.get("steps", [])
             }
+        
+        await websocket.send_json({
+            "type": "session_started",
+            "data": session_data
         })
         
         # Process incoming video frames

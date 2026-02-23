@@ -1,10 +1,12 @@
 import { useState, useEffect, useRef } from 'react';
 import { Play, Square, AlertCircle, CheckCircle } from 'lucide-react';
 import LiveSurgeryWebSocket from '../services/websocket';
-import { proceduresAPI } from '../services/api';
+import { proceduresAPI, outlierProceduresAPI } from '../services/api';
 
 function LiveMonitoringPage() {
   const [procedures, setProcedures] = useState([]);
+  const [outlierProcedures, setOutlierProcedures] = useState([]);
+  const [analysisMode, setAnalysisMode] = useState('standard'); // 'standard' or 'error-resolution'
   const [selectedProcedure, setSelectedProcedure] = useState('');
   const [sessionId, setSessionId] = useState('');
   const [surgeonId, setSurgeonId] = useState('surgeon-001');
@@ -27,6 +29,7 @@ function LiveMonitoringPage() {
   useEffect(() => {
     // Load procedures and cameras on mount
     loadProcedures();
+    loadOutlierProcedures();
     listAvailableCameras();
     
     return () => {
@@ -42,9 +45,19 @@ function LiveMonitoringPage() {
     try {
       const data = await proceduresAPI.getAll();
       setProcedures(data);
-      addMessage('info', 'Procedures loaded successfully');
+      addMessage('info', 'Standard procedures loaded successfully');
     } catch (error) {
       addMessage('error', `Failed to load procedures: ${error.message}`);
+    }
+  };
+
+  const loadOutlierProcedures = async () => {
+    try {
+      const data = await outlierProceduresAPI.getAll();
+      setOutlierProcedures(data);
+      addMessage('info', 'Error resolution protocols loaded successfully');
+    } catch (error) {
+      addMessage('error', `Failed to load error resolution protocols: ${error.message}`);
     }
   };
 
@@ -111,6 +124,12 @@ function LiveMonitoringPage() {
       wsRef.current = new LiveSurgeryWebSocket();
       
       wsRef.current.onMessage((data) => {
+        if (data.error) {
+          addMessage('error', data.error);
+          setIsConnected(false);
+          return;
+        }
+        
         if (data.type === 'session_started') {
           setSessionInfo(data.data);
           setIsConnected(true);
@@ -147,7 +166,10 @@ function LiveMonitoringPage() {
         addMessage('info', 'WebSocket disconnected');
       });
 
-      await wsRef.current.connect(sessionId, selectedProcedure, surgeonId);
+      // Map analysisMode to procedure_source
+      const procedureSource = analysisMode === 'error-resolution' ? 'outlier' : 'standard';
+      
+      await wsRef.current.connect(sessionId, selectedProcedure, surgeonId, procedureSource);
       
     } catch (error) {
       addMessage('error', `Connection failed: ${error.message}`);
@@ -254,10 +276,34 @@ function LiveMonitoringPage() {
           <div className="bg-white rounded-lg shadow-md p-6">
             <h2 className="text-xl font-semibold mb-4">Session Control</h2>
             
+            {/* Analysis Mode Selection */}
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Analysis Mode
+              </label>
+              <select
+                value={analysisMode}
+                onChange={(e) => {
+                  setAnalysisMode(e.target.value);
+                  setSelectedProcedure(''); // Reset procedure selection when mode changes
+                }}
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500"
+                disabled={isConnected}
+              >
+                <option value="standard">Standard Monitoring</option>
+                <option value="error-resolution">Error Resolution Protocol</option>
+              </select>
+              <p className="mt-1 text-xs text-gray-500">
+                {analysisMode === 'standard' 
+                  ? 'Track procedure steps and progress' 
+                  : 'Advanced error detection with safety checkpoints'}
+              </p>
+            </div>
+
             {/* Procedure Selection */}
             <div className="mb-4">
               <label className="block text-sm font-medium text-gray-700 mb-2">
-                Select Procedure
+                {analysisMode === 'standard' ? 'Select Procedure' : 'Select Protocol'}
               </label>
               <select
                 value={selectedProcedure}
@@ -265,13 +311,32 @@ function LiveMonitoringPage() {
                 className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500"
                 disabled={isConnected}
               >
-                <option value="">-- Select a procedure --</option>
-                {procedures.map((proc) => (
-                  <option key={proc.id} value={proc.id}>
-                    {proc.procedure_name}
-                  </option>
-                ))}
+                <option value="">
+                  {analysisMode === 'standard' 
+                    ? '-- Select a procedure --' 
+                    : '-- Select an error resolution protocol --'}
+                </option>
+                {analysisMode === 'standard' 
+                  ? procedures.map((proc) => (
+                      <option key={proc.id} value={proc.id}>
+                        {proc.procedure_name}
+                      </option>
+                    ))
+                  : outlierProcedures.map((proc) => (
+                      <option key={proc.id} value={proc.id}>
+                        {proc.procedure_name} (v{proc.version})
+                      </option>
+                    ))
+                }
               </select>
+              {analysisMode === 'error-resolution' && outlierProcedures.length === 0 && (
+                <p className="mt-2 text-sm text-amber-600">
+                  ⚠️ No error resolution protocols found. Please upload an outlier resolution document first using the API endpoint: 
+                  <code className="block mt-1 text-xs bg-gray-100 p-1 rounded">
+                    POST /api/outlier-procedures/upload
+                  </code>
+                </p>
+              )}
             </div>
 
             {/* Camera Selection */}
