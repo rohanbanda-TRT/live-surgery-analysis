@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { Play, Square, AlertCircle, CheckCircle } from 'lucide-react';
 import LiveSurgeryWebSocket from '../services/websocket';
 import { proceduresAPI, outlierProceduresAPI } from '../services/api';
+import OutlierPhaseTracker from '../components/OutlierPhaseTracker';
 
 function LiveMonitoringPage() {
   const [procedures, setProcedures] = useState([]);
@@ -146,10 +147,30 @@ function LiveMonitoringPage() {
           setAlerts(prev => [...prev, ...data.data]);
           addMessage('warning', `Alert received: ${data.data.length} new alerts`);
         } else if (data.type === 'analysis_update') {
+          console.log('[LiveMonitoring] Analysis update received:', {
+            procedure_source: data.data.procedure_source,
+            frame_count: data.data.frame_count,
+            all_steps_count: data.data.all_steps?.length,
+            first_step_sample: data.data.all_steps?.[0],
+            full_data: data.data
+          });
+          
           setCurrentAnalysis(data.data);
           setAnalysisHistory(prev => [...prev.slice(-9), data.data]);
+          
           // Update all steps with latest status
           if (data.data.all_steps) {
+            console.log('[LiveMonitoring] Setting all steps:', {
+              count: data.data.all_steps.length,
+              steps: data.data.all_steps.map((s, i) => ({
+                index: i,
+                phase_number: s.phase_number,
+                phase_name: s.phase_name,
+                step_name: s.step_name,
+                status: s.status,
+                has_checkpoints: s.checkpoints?.length > 0
+              }))
+            });
             setAllSteps(data.data.all_steps);
           }
           addMessage('info', `Analysis: Frame ${data.data.frame_count} - ${data.data.current_step_name}`);
@@ -503,79 +524,93 @@ function LiveMonitoringPage() {
             </div>
           </div>
 
-          {/* Procedure Steps Tracker */}
+          {/* Procedure Steps Tracker - Conditional Rendering */}
           {allSteps.length > 0 && (
             <div className="bg-white rounded-lg shadow-md p-6">
-              <h2 className="text-xl font-semibold mb-4">Procedure Steps Tracker</h2>
-              <div className="space-y-3">
-                {allSteps.map((step, index) => {
-                  const getStatusColor = (status) => {
-                    switch(status) {
-                      case 'completed': return 'bg-green-50 border-green-500';
-                      case 'current': return 'bg-blue-50 border-blue-500';
-                      case 'missed': return 'bg-red-50 border-red-500';
-                      default: return 'bg-gray-50 border-gray-300';
-                    }
-                  };
-                  
-                  const getStatusBadge = (status) => {
-                    switch(status) {
-                      case 'completed': return 'bg-green-100 text-green-800';
-                      case 'current': return 'bg-blue-100 text-blue-800';
-                      case 'missed': return 'bg-red-100 text-red-800';
-                      default: return 'bg-gray-100 text-gray-600';
-                    }
-                  };
-                  
-                  const getStatusIcon = (status) => {
-                    switch(status) {
-                      case 'completed': return '✓';
-                      case 'current': return '▶';
-                      case 'missed': return '✗';
-                      default: return '○';
-                    }
-                  };
-                  
-                  return (
-                    <div
-                      key={index}
-                      className={`p-4 rounded-lg border-l-4 ${getStatusColor(step.status)} transition-all duration-300`}
-                    >
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center flex-1">
-                          <span className={`inline-flex items-center justify-center w-8 h-8 rounded-full font-semibold mr-3 ${
-                            step.status === 'completed' ? 'bg-green-600 text-white' :
-                            step.status === 'current' ? 'bg-blue-600 text-white' :
-                            step.status === 'missed' ? 'bg-red-600 text-white' :
-                            'bg-gray-400 text-white'
-                          }`}>
-                            {step.step_number}
-                          </span>
-                          <div className="flex-1">
-                            <div className="flex items-center gap-2">
-                              <h3 className="font-semibold text-gray-900">{step.step_name}</h3>
-                              {step.is_critical && (
-                                <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">
-                                  Critical
-                                </span>
+              <h2 className="text-xl font-semibold mb-4">
+                {analysisMode === 'error-resolution' 
+                  ? 'Surgical Phases & Safety Checkpoints' 
+                  : 'Procedure Steps Tracker'}
+              </h2>
+              
+              {analysisMode === 'error-resolution' ? (
+                // Outlier mode: Show phases with checkpoints
+                <OutlierPhaseTracker 
+                  phases={allSteps} 
+                  currentPhaseIndex={currentAnalysis?.current_step_index || 0}
+                />
+              ) : (
+                // Standard mode: Show traditional step tracker
+                <div className="space-y-3">
+                  {allSteps.map((step, index) => {
+                    const getStatusColor = (status) => {
+                      switch(status) {
+                        case 'completed': return 'bg-green-50 border-green-500';
+                        case 'current': return 'bg-blue-50 border-blue-500';
+                        case 'missed': return 'bg-red-50 border-red-500';
+                        default: return 'bg-gray-50 border-gray-300';
+                      }
+                    };
+                    
+                    const getStatusBadge = (status) => {
+                      switch(status) {
+                        case 'completed': return 'bg-green-100 text-green-800';
+                        case 'current': return 'bg-blue-100 text-blue-800';
+                        case 'missed': return 'bg-red-100 text-red-800';
+                        default: return 'bg-gray-100 text-gray-600';
+                      }
+                    };
+                    
+                    const getStatusIcon = (status) => {
+                      switch(status) {
+                        case 'completed': return '✓';
+                        case 'current': return '▶';
+                        case 'missed': return '✗';
+                        default: return '○';
+                      }
+                    };
+                    
+                    return (
+                      <div
+                        key={index}
+                        className={`p-4 rounded-lg border-l-4 ${getStatusColor(step.status)} transition-all duration-300`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center flex-1">
+                            <span className={`inline-flex items-center justify-center w-8 h-8 rounded-full font-semibold mr-3 ${
+                              step.status === 'completed' ? 'bg-green-600 text-white' :
+                              step.status === 'current' ? 'bg-blue-600 text-white' :
+                              step.status === 'missed' ? 'bg-red-600 text-white' :
+                              'bg-gray-400 text-white'
+                            }`}>
+                              {step.step_number}
+                            </span>
+                            <div className="flex-1">
+                              <div className="flex items-center gap-2">
+                                <h3 className="font-semibold text-gray-900">{step.step_name}</h3>
+                                {step.is_critical && (
+                                  <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">
+                                    Critical
+                                  </span>
+                                )}
+                              </div>
+                              {step.description && (
+                                <p className="text-sm text-gray-600 mt-1">{step.description}</p>
                               )}
                             </div>
-                            {step.description && (
-                              <p className="text-sm text-gray-600 mt-1">{step.description}</p>
-                            )}
+                          </div>
+                          <div className="ml-4">
+                            <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-medium ${getStatusBadge(step.status)}`}>
+                              <span className="mr-1">{getStatusIcon(step.status)}</span>
+                              {step.status.charAt(0).toUpperCase() + step.status.slice(1)}
+                            </span>
                           </div>
                         </div>
-                        <div className="ml-4">
-                          <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-medium ${getStatusBadge(step.status)}`}>
-                            <span className="mr-1">{getStatusIcon(step.status)}</span>
-                            {step.status.charAt(0).toUpperCase() + step.status.slice(1)}
-                          </span>
-                        </div>
                       </div>
-                    </div>
-                  );
-                })}
-              </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 

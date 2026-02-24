@@ -12,7 +12,8 @@ import numpy as np
 from app.services.gemini_client import GeminiClient
 from app.db.collections import MASTER_PROCEDURES, SURGICAL_STEPS, LIVE_SESSIONS, SESSION_ALERTS, OUTLIER_PROCEDURES
 from app.core.logging import logger
-from app.prompts.surgical_analysis import get_outlier_chunk_analysis_prompt
+from app.prompts.outlier_prompts import get_outlier_chunk_analysis_prompt
+from app.prompts.standard_prompts import get_standard_chunk_analysis_prompt
 from app.services.outlier_analysis import OutlierAnalysisParser, CheckpointTracker
 
 
@@ -430,52 +431,17 @@ class LiveSurgeryService:
                 )
             else:
                 # Use standard prompt for master procedures
-                current_step_detail = f"""
-**Current Expected Step {current_step.get('step_number', self.current_step_index + 1)}: {current_step['step_name']}**
-- Description: {current_step.get('description', 'N/A')}
-- Expected Duration: {current_step.get('expected_duration_min', 'N/A')}-{current_step.get('expected_duration_max', 'N/A')} minutes
-- Critical Step: {'YES - Extra caution required' if current_step.get('is_critical') else 'No'}
-- Required Instruments: {', '.join(current_step.get('instruments_required', [])) or 'Not specified'}
-- Anatomical Landmarks: {', '.join(current_step.get('anatomical_landmarks', [])) or 'Not specified'}
-- Visual Cues: {current_step.get('visual_cues', 'Not specified')}
-"""
-                
                 procedure_name = self.master_procedure.get('procedure_name') if self.master_procedure else 'Unknown Procedure'
                 
-                prompt = f"""Analyze this {len(chunk_data['frames'])}-second surgical video clip from {procedure_name}.
-
-**MASTER PROCEDURE CONTEXT:**
-{current_step_detail}
-
-**DETECTED STEPS (CUMULATIVE - ALREADY IDENTIFIED):** 
-{detected_context}
-{cumulative_note}
-**REMAINING STEPS (FOCUS ON DETECTING THESE):** 
-{remaining_context}
-{history_context}
-**CRITICAL RULES - CUMULATIVE TRACKING:**
-1. This is CUMULATIVE analysis - once a step is detected, it REMAINS detected forever
-2. **FOCUS ONLY on remaining steps** - detected steps are already confirmed
-3. Compare video against the MASTER PROCEDURE definition above
-4. Steps take MINUTES (50-200+ frames at 1 FPS), not seconds
-5. Mark "completed" ONLY when you see clear evidence the step description is fulfilled
-6. "in-progress" is default - be conservative
-7. Verify actual surgical actions match the step description, not just instrument presence
-8. Review analysis history and master procedure definition before making status updates
-9. Match visible instruments and anatomical landmarks against requirements
-10. **DO NOT re-detect already detected steps** - they remain in the detected list automatically
-
-**RESPONSE FORMAT:**
-Detected Step: [number] - [name]
-Action Being Performed: [what surgeon is doing - compare to step description]
-Instruments Visible: [list - compare to required instruments]
-Anatomical Landmarks: [list - compare to expected landmarks]
-Matches Expected: [yes/no - does video match master procedure definition?]
-Step Progress: [just-started/in-progress/nearing-completion/completed]
-Completion Evidence: [required if completed - what proves step description is fulfilled? else "N/A"]
-Analysis: [brief observation comparing video to master procedure]
-
-Analyze the video clip and respond:"""
+                prompt = get_standard_chunk_analysis_prompt(
+                    procedure_name=procedure_name,
+                    current_step=current_step,
+                    detected_context=detected_context,
+                    remaining_context=remaining_context,
+                    history_context=history_context,
+                    cumulative_note=cumulative_note,
+                    chunk_duration=len(chunk_data['frames'])
+                )
             
             logger.info(
                 "chunk_prompt_built",
