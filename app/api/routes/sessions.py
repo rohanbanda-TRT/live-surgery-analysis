@@ -73,13 +73,44 @@ async def websocket_endpoint(
                 await websocket.close()
                 return
             
+            # Build complete phase data with checkpoints for outlier mode
+            phases_data = []
+            for i, phase in enumerate(service.outlier_procedure.get("phases", [])):
+                phase_number = phase["phase_number"]
+                
+                # Get checkpoint status
+                checkpoint_info = service.checkpoint_tracker.get_phase_checkpoint_status(phase_number) if service.checkpoint_tracker else {}
+                
+                phase_data = {
+                    "step_number": phase_number,
+                    "step_name": phase["phase_name"],
+                    "phase_number": phase_number,
+                    "phase_name": phase["phase_name"],
+                    "description": phase.get("goal"),
+                    "goal": phase.get("goal"),
+                    "priority": phase.get("priority"),
+                    "is_critical": phase.get("priority") == "HIGH",
+                    "status": "pending",
+                    "detected": False,
+                    "checkpoints": checkpoint_info.get('checkpoints', []),
+                    "detected_errors": []
+                }
+                phases_data.append(phase_data)
+            
+            logger.info(
+                "session_started_outlier_mode",
+                session_id=session_id,
+                phases_count=len(phases_data),
+                sample_phase=phases_data[0] if phases_data else None
+            )
+            
             session_data = {
                 "procedure_name": service.outlier_procedure.get("procedure_name"),
                 "procedure_type": service.outlier_procedure.get("procedure_type"),
                 "procedure_source": "outlier",
                 "version": service.outlier_procedure.get("version"),
-                "total_steps": len(service.procedure_steps),
-                "steps": service.procedure_steps
+                "total_steps": len(phases_data),
+                "steps": phases_data
             }
         else:
             if not service.master_procedure:

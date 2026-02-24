@@ -430,11 +430,27 @@ def get_outlier_chunk_analysis_prompt(
                 detected_context += f"✓ Phase {phase_num}: {phase['phase_name']}\n"
         detected_context += "\n"
     
-    # Build remaining phases focus
+    # Build remaining phases focus with checkpoint details
     remaining_context = "**REMAINING PHASES TO DETECT:**\n"
     if remaining_phases:
-        for phase in remaining_phases[:5]:  # Show next 5 phases
-            remaining_context += f"→ Phase {phase['phase_number']}: {phase['phase_name']} (Priority: {phase['priority']})\n"
+        for phase in remaining_phases[:3]:  # Show next 3 phases with full details
+            remaining_context += f"\n→ Phase {phase['phase_number']}: {phase['phase_name']} (Priority: {phase['priority']})\n"
+            remaining_context += f"  Goal: {phase['goal']}\n"
+            
+            # Add checkpoint requirements for this phase
+            if phase.get('checkpoints'):
+                remaining_context += f"  **Checkpoints to validate:**\n"
+                for checkpoint in phase['checkpoints']:
+                    blocking_marker = " [BLOCKING]" if checkpoint.get('blocking') else ""
+                    remaining_context += f"    • {checkpoint['name']}{blocking_marker}\n"
+                    for req in checkpoint['requirements']:
+                        remaining_context += f"      - {req}\n"
+            
+            # Add critical errors to watch for
+            if phase.get('critical_errors'):
+                remaining_context += f"  **Critical errors to avoid:**\n"
+                for error in phase['critical_errors'][:3]:  # Top 3 errors
+                    remaining_context += f"    • {error['error_code']}: {error['description']}\n"
     else:
         remaining_context += "All phases detected. Focus on final inspection and verification.\n"
     remaining_context += "\n"
@@ -457,7 +473,7 @@ def get_outlier_chunk_analysis_prompt(
 
 {history_context}
 
-**YOUR TASK - ERROR DETECTION & PHASE VALIDATION:**
+**YOUR TASK - ERROR DETECTION & CHECKPOINT-BASED PHASE VALIDATION:**
 
 Analyze this video chunk and provide:
 
@@ -475,38 +491,53 @@ Analyze this video chunk and provide:
      * C1 (Check Omitted) - Missing fluoroscopy, imaging verification
    - Report error code, description, and severity (HIGH/MEDIUM/LOW)
 
-3. **CHECKPOINT VALIDATION:**
-   - Are all prerequisites for this phase met?
-   - Are required anatomical landmarks visible?
-   - Have critical sub-tasks been completed?
-   - Should progression be BLOCKED? (YES/NO with reason)
+3. **CHECKPOINT VALIDATION (CRITICAL - REQUIRED FOR PHASE COMPLETION):**
+   For the detected phase, validate EACH checkpoint requirement:
+   - Review the checkpoint requirements listed above for the current phase
+   - For EACH requirement, verify if it is satisfied in the video
+   - **BLOCKING checkpoints MUST be satisfied before phase can progress**
+   - Report which requirements are MET and which are NOT MET
+   - Provide specific visual evidence for each checkpoint validation
+   
+   Example checkpoint validation:
+   - "Anatomical Exposure Verified: MET - Clear view of mitral annulus visible"
+   - "Leaflet Mobility Assessed: NOT MET - Leaflets not yet visible in frame"
+   - "Coagulation Completed: MET - Cautery marks visible on tissue edges"
 
-4. **OMISSION DETECTION (Error A8):**
+4. **PHASE COMPLETION LOGIC:**
+   A phase can ONLY be marked as "completed" if:
+   - The phase has been detected in the video
+   - ALL checkpoint requirements are satisfied (especially BLOCKING ones)
+   - No critical errors are present
+   
+   If checkpoints are incomplete:
+   - Mark phase as "in-progress" 
+   - List which checkpoints are blocking completion
+   - Specify what needs to be observed to satisfy them
+
+5. **OMISSION DETECTION (Error A8):**
    - Was vessel coagulation performed before tissue manipulation?
    - Was fluoroscopy verification done when required?
    - Are critical steps being skipped?
 
-5. **STEP PROGRESS:**
-   - Phase status: in-progress / completed / not-started
-   - Completion evidence (what confirms this phase is done?)
-   - Next expected phase
-
 **CRITICAL RULES:**
 - Once a phase is detected, it remains in the cumulative detected list
 - Focus ONLY on remaining phases - detected phases are already confirmed
+- **A phase is NOT completed until ALL its checkpoints are validated**
 - Mark HIGH priority errors immediately
-- Block progression if prerequisites not met
-- Verify checkpoints before allowing phase completion
+- Block progression if BLOCKING checkpoints not met
 - Detect omissions (A8) proactively
+- Be specific about which checkpoint requirements are met/not met
 
 **OUTPUT FORMAT:**
 Detected Phase: [phase_number or null]
 Matches Expected: [YES/NO]
 Error Codes Detected: [list of codes or "None"]
-Checkpoint Status: [PASS/FAIL with details]
+Checkpoint Status: [PASS/FAIL]
+Checkpoint Details: [For each checkpoint requirement: "Requirement name: MET/NOT MET - Evidence"]
 Step Progress: [in-progress/completed/not-started]
-Completion Evidence: [specific observations]
-Block Progression: [YES/NO with reason]
+Completion Evidence: [specific observations - only if ALL checkpoints PASS]
+Block Progression: [YES/NO with reason - YES if BLOCKING checkpoints not met]
 Analysis: [Detailed observations and recommendations]
 """
     

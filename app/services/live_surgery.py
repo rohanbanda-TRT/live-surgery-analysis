@@ -13,6 +13,7 @@ from app.services.gemini_client import GeminiClient
 from app.db.collections import MASTER_PROCEDURES, SURGICAL_STEPS, LIVE_SESSIONS, SESSION_ALERTS, OUTLIER_PROCEDURES
 from app.core.logging import logger
 from app.prompts.surgical_analysis import get_outlier_chunk_analysis_prompt
+from app.services.outlier_analysis import OutlierAnalysisParser, CheckpointTracker
 
 
 class LiveSurgeryService:
@@ -49,6 +50,10 @@ class LiveSurgeryService:
         self.step_status: Dict[int, str] = {}  # step_index -> status (pending/detected/missed)
         self.step_detection_history: Dict[int, List[str]] = {}  # step_index -> list of detection analyses
         self.phase_number_to_index: Dict[str, int] = {}  # For outlier mode: phase_number -> index mapping
+        
+        # Outlier mode: checkpoint tracking
+        self.checkpoint_tracker: Optional[CheckpointTracker] = None
+        self.outlier_parser = OutlierAnalysisParser()
         
         # Video chunk processing
         self.frame_buffer: List[bytes] = []
@@ -123,6 +128,11 @@ class LiveSurgeryService:
                     phase["phase_number"]: i 
                     for i, phase in enumerate(self.outlier_procedure.get("phases", []))
                 }
+                
+                # Initialize checkpoint tracker for outlier mode
+                self.checkpoint_tracker = CheckpointTracker()
+                for phase in self.outlier_procedure.get("phases", []):
+                    self.checkpoint_tracker.initialize_phase_checkpoints(phase)
                 
                 logger.info(
                     "outlier_procedure_loaded",
@@ -517,16 +527,48 @@ Analyze the video clip and respond:"""
             # Parse AI response differently for outlier vs standard mode
             if self.procedure_source == "outlier":
                 # For outlier mode: parse phase_number (e.g., "3.4") from AI response
-                detected_phase_number = self._parse_detected_phase_number(analysis)
+                detected_phase_number = self.outlier_parser.parse_detected_phase(analysis)
                 # Convert phase_number to index
                 detected_step_index = self.phase_number_to_index.get(detected_phase_number) if detected_phase_number else None
+                
+                # Parse checkpoint status for outlier mode
+                checkpoint_status = self.outlier_parser.parse_checkpoint_status(analysis)
+                error_codes = self.outlier_parser.parse_error_codes(analysis)
+                
+                # Update checkpoint tracker with AI-provided checkpoint details
+                if detected_phase_number and checkpoint_status.get("details"):
+                    logger.info(
+                        "updating_checkpoint_tracker",
+                        session_id=self.session_id,
+                        phase_number=detected_phase_number,
+                        checkpoint_details_count=len(checkpoint_status["details"])
+                    )
+                    self.checkpoint_tracker.update_from_ai_checkpoint_details(
+                        detected_phase_number,
+                        checkpoint_status["details"]
+                    )
+                
+                # For outlier mode, phase completion depends on checkpoints
+                step_progress = self.outlier_parser.parse_step_progress(analysis)
+                completion_evidence = self.outlier_parser.parse_completion_evidence(analysis)
+                
+                logger.info(
+                    "outlier_analysis_parsed",
+                    session_id=self.session_id,
+                    detected_phase=detected_phase_number,
+                    checkpoint_status=checkpoint_status.get("status"),
+                    error_count=len(error_codes),
+                    step_progress=step_progress
+                )
             else:
                 # For standard mode: parse step index as before
                 detected_step_index = self._parse_detected_step(analysis)
+                checkpoint_status = None
+                error_codes = []
+                step_progress = self._parse_step_progress(analysis)
+                completion_evidence = self._parse_completion_evidence(analysis)
             
             matches_expected = "yes" in analysis.lower() and "matches expected: yes" in analysis.lower()
-            step_progress = self._parse_step_progress(analysis)
-            completion_evidence = self._parse_completion_evidence(analysis)
             
             # Log current state before processing
             logger.info(
@@ -602,36 +644,125 @@ Analyze the video clip and respond:"""
                     )
                     current_step_for_display = self.procedure_steps[next_undetected_index]
                     
+                    # Build all_steps with checkpoint information for outlier mode
+                    all_steps_data = []
+                    
+                    logger.info(
+                        "building_analysis_callback_data",
+                        session_id=self.session_id,
+                        procedure_source=self.procedure_source,
+                        total_steps=len(self.procedure_steps),
+                        detected_cumulative=list(self.detected_steps_cumulative)
+                    )
+                    
+                    for i, s in enumerate(self.procedure_steps):
+                        step_data = {
+                            "step_number": s.get('step_number', i+1),
+                            "step_name": s['step_name'],
+                            "description": s.get('description'),
+                            "is_critical": s.get('is_critical', False),
+                            "detected": i in self.detected_steps_cumulative
+                        }
+                        
+                        # For outlier mode, add checkpoint and phase-specific data
+                        if self.procedure_source == "outlier":
+                            phase_number = s.get('phase_number')
+                            phase = self.outlier_procedure['phases'][i] if i < len(self.outlier_procedure.get('phases', [])) else {}
+                            
+                            logger.debug(
+                                "building_phase_data",
+                                session_id=self.session_id,
+                                phase_index=i,
+                                phase_number=phase_number,
+                                phase_name=phase.get('phase_name'),
+                                has_phase_data=bool(phase)
+                            )
+                            
+                            # Get checkpoint status for this phase
+                            checkpoint_info = self.checkpoint_tracker.get_phase_checkpoint_status(phase_number) if self.checkpoint_tracker else {}
+                            
+                            logger.debug(
+                                "checkpoint_info_retrieved",
+                                session_id=self.session_id,
+                                phase_number=phase_number,
+                                has_checkpoints=checkpoint_info.get('has_checkpoints'),
+                                all_complete=checkpoint_info.get('all_complete'),
+                                checkpoint_count=len(checkpoint_info.get('checkpoints', []))
+                            )
+                            
+                            # Determine phase status based on checkpoints
+                            if i in self.detected_steps_cumulative:
+                                # Phase is detected, check if checkpoints are complete
+                                if checkpoint_info.get('has_checkpoints'):
+                                    if checkpoint_info.get('all_complete'):
+                                        phase_status = "completed"
+                                    else:
+                                        # Check if there are blocking checkpoints
+                                        blocking_checkpoints = self.checkpoint_tracker.get_blocking_checkpoints(phase_number) if self.checkpoint_tracker else []
+                                        phase_status = "blocked" if blocking_checkpoints else "current"
+                                else:
+                                    # No checkpoints, phase is completed when detected
+                                    phase_status = "completed"
+                            else:
+                                phase_status = self.step_status.get(i, "pending")
+                            
+                            step_data.update({
+                                "phase_number": phase_number,
+                                "phase_name": phase.get('phase_name'),  # Add phase_name explicitly
+                                "goal": phase.get('goal'),
+                                "priority": phase.get('priority'),
+                                "status": phase_status,
+                                "checkpoints": checkpoint_info.get('checkpoints', []),
+                                "detected_errors": error_codes if i == detected_step_index else []
+                            })
+                            
+                            logger.info(
+                                "phase_data_built",
+                                session_id=self.session_id,
+                                phase_index=i,
+                                phase_number=phase_number,
+                                phase_name=step_data.get('phase_name'),
+                                status=phase_status,
+                                checkpoint_count=len(step_data.get('checkpoints', []))
+                            )
+                        else:
+                            # Standard mode status
+                            step_data["status"] = (
+                                "completed" if i in self.detected_steps_cumulative
+                                else self.step_status.get(i, "pending")
+                            )
+                        
+                        all_steps_data.append(step_data)
+                    
+                    logger.info(
+                        "all_steps_data_complete",
+                        session_id=self.session_id,
+                        total_phases=len(all_steps_data),
+                        sample_phase=all_steps_data[0] if all_steps_data else None
+                    )
+                    
                     analysis_data = {
                         "frame_count": frame_info["end_frame"],
                         "current_step_index": next_undetected_index,
                         "current_step_name": current_step_for_display['step_name'],
                         "detected_step_index": detected_step_index,
                         "matches_expected": matches_expected,
+                        "procedure_source": self.procedure_source,
                         "expected_step": {
                             "step_number": current_step_for_display.get('step_number'),
                             "step_name": current_step_for_display['step_name'],
                             "description": current_step_for_display.get('description'),
                             "is_critical": current_step_for_display.get('is_critical', False)
                         },
-                        "all_steps": [
-                            {
-                                "step_number": s.get('step_number', i+1),
-                                "step_name": s['step_name'],
-                                "description": s.get('description'),
-                                "is_critical": s.get('is_critical', False),
-                                # Map internal status to frontend-compatible values
-                                "status": (
-                                    "completed" if i in self.detected_steps_cumulative
-                                    else self.step_status.get(i, "pending")
-                                ),
-                                "detected": i in self.detected_steps_cumulative
-                            }
-                            for i, s in enumerate(self.procedure_steps)
-                        ],
+                        "all_steps": all_steps_data,
                         "analysis_text": analysis,
                         "timestamp": datetime.utcnow().isoformat()
                     }
+                    
+                    # Add outlier-specific data
+                    if self.procedure_source == "outlier" and checkpoint_status:
+                        analysis_data["checkpoint_status"] = checkpoint_status
+                    
                     await self.analysis_callback(analysis_data)
                 except Exception as callback_error:
                     # WebSocket may be closed - log but don't fail processing
