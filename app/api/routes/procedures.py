@@ -1,7 +1,7 @@
 """
 API routes for surgical procedures.
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pymongo.asynchronous.database import AsyncDatabase
 from typing import List
 from bson import ObjectId
@@ -16,6 +16,8 @@ from app.schemas.procedure import (
     VideoAnalysisResponse
 )
 from app.services.video_analysis import VideoAnalysisService
+from app.services.recorded_video_comparison import RecordedVideoComparisonService
+from app.services.video_upload import VideoUploadService
 
 router = APIRouter()
 
@@ -57,6 +59,62 @@ async def get_procedure(
     return procedure
 
 
+@router.post("/upload-video")
+async def upload_video(
+    file: UploadFile = File(...)
+):
+    """
+    Upload a video file to Google Cloud Storage.
+    
+    Returns the GCS URI that can be used for analysis or comparison.
+    
+    Args:
+        file: Video file to upload (MP4, AVI, MOV, etc.)
+        
+    Returns:
+        Dictionary with gcs_uri and filename
+    """
+    # Validate file type
+    allowed_types = ["video/mp4", "video/avi", "video/mov", "video/quicktime", "video/x-msvideo"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Allowed types: {', '.join(allowed_types)}"
+        )
+    
+    # Validate file size (max 500MB)
+    max_size = 500 * 1024 * 1024  # 500MB
+    file.file.seek(0, 2)  # Seek to end
+    file_size = file.file.tell()
+    file.file.seek(0)  # Reset to beginning
+    
+    if file_size > max_size:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large. Maximum size is 500MB, got {file_size / 1024 / 1024:.2f}MB"
+        )
+    
+    try:
+        upload_service = VideoUploadService()
+        gcs_uri = await upload_service.upload_video(
+            file=file.file,
+            filename=file.filename,
+            content_type=file.content_type
+        )
+        
+        return {
+            "gcs_uri": gcs_uri,
+            "filename": file.filename,
+            "size_mb": round(file_size / 1024 / 1024, 2),
+            "message": "Video uploaded successfully"
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Upload failed: {str(e)}"
+        )
+
+
 @router.post("/analyze", response_model=VideoAnalysisResponse)
 async def analyze_video(
     request: VideoAnalysisRequest,
@@ -74,3 +132,65 @@ async def analyze_video(
     )
     
     return result
+
+
+@router.post("/compare")
+async def compare_recorded_video(
+    request: dict,
+    db: AsyncDatabase = Depends(get_db)
+):
+    """
+    Compare a recorded video against a procedure.
+    
+    Analyzes the FULL video at once (not in chunks) and returns:
+    - Which steps/phases were detected
+    - Which checkpoints were met (for outlier mode)
+    - Which error codes were detected
+    - Overall comparison results
+    
+    Similar to live monitoring but for recorded videos.
+    
+    Request body:
+        {
+            "video_gs_uri": "gs://bucket/video.mp4",
+            "procedure_id": "507f1f77bcf86cd799439011",
+            "procedure_source": "standard"  // or "outlier"
+        }
+    
+    Returns:
+        Complete comparison results with detected steps, checkpoints, and errors
+    """
+    video_gs_uri = request.get("video_gs_uri")
+    procedure_id = request.get("procedure_id")
+    procedure_source = request.get("procedure_source", "standard")
+    
+    if not video_gs_uri:
+        raise HTTPException(status_code=400, detail="video_gs_uri is required")
+    
+    if not procedure_id:
+        raise HTTPException(status_code=400, detail="procedure_id is required")
+    
+    if not ObjectId.is_valid(procedure_id):
+        raise HTTPException(status_code=400, detail="Invalid procedure ID")
+    
+    if procedure_source not in ["standard", "outlier"]:
+        raise HTTPException(
+            status_code=400, 
+            detail="procedure_source must be 'standard' or 'outlier'"
+        )
+    
+    try:
+        service = RecordedVideoComparisonService(db)
+        result = await service.compare_video(
+            video_gs_uri=video_gs_uri,
+            procedure_id=procedure_id,
+            procedure_source=procedure_source
+        )
+        
+        return result
+    except ValueError as e:
+        # Handle user-friendly errors (rate limits, validation, etc.)
+        raise HTTPException(status_code=429 if "rate limit" in str(e).lower() else 400, detail=str(e))
+    except Exception as e:
+        # Handle unexpected errors
+        raise HTTPException(status_code=500, detail=f"Comparison failed: {str(e)}")

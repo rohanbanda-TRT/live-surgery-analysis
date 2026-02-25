@@ -490,33 +490,52 @@ class LiveSurgeryService:
     ):
         """Process analysis response using cumulative step tracking (like reference implementation)."""
         try:
+            # Increment chunk counter for history tracking
+            if self.procedure_source == "outlier" and self.checkpoint_tracker:
+                self.checkpoint_tracker.increment_chunk_counter()
+            
             # Parse AI response differently for outlier vs standard mode
             if self.procedure_source == "outlier":
-                # For outlier mode: parse phase_number (e.g., "3.4") from AI response
+                # For outlier mode: parse phase_number and checkpoint details
                 detected_phase_number = self.outlier_parser.parse_detected_phase(analysis)
-                # Convert phase_number to index
-                detected_step_index = self.phase_number_to_index.get(detected_phase_number) if detected_phase_number else None
-                
-                # Parse checkpoint status for outlier mode
                 checkpoint_status = self.outlier_parser.parse_checkpoint_status(analysis)
                 error_codes = self.outlier_parser.parse_error_codes(analysis)
+                step_progress = self.outlier_parser.parse_step_progress(analysis)
+                completion_evidence = self.outlier_parser.parse_completion_evidence(analysis)
                 
-                # Update checkpoint tracker with AI-provided checkpoint details
+                # Convert phase_number to index for cumulative tracking
+                detected_step_index = self.phase_number_to_index.get(detected_phase_number) if detected_phase_number else None
+                
+                # Update checkpoint tracker if we have checkpoint details
                 if detected_phase_number and checkpoint_status.get("details"):
-                    logger.info(
-                        "updating_checkpoint_tracker",
-                        session_id=self.session_id,
-                        phase_number=detected_phase_number,
-                        checkpoint_details_count=len(checkpoint_status["details"])
-                    )
                     self.checkpoint_tracker.update_from_ai_checkpoint_details(
                         detected_phase_number,
                         checkpoint_status["details"]
                     )
                 
-                # For outlier mode, phase completion depends on checkpoints
-                step_progress = self.outlier_parser.parse_step_progress(analysis)
-                completion_evidence = self.outlier_parser.parse_completion_evidence(analysis)
+                # CRITICAL: A8 (Operation Omitted) Detection via prerequisite validation
+                if detected_phase_number and self.checkpoint_tracker:
+                    eligibility = self.checkpoint_tracker.is_phase_eligible(detected_phase_number)
+                    
+                    if not eligibility["eligible"]:
+                        # Phase detected but prerequisites not satisfied = A8 error
+                        for prereq in eligibility["blocking_prerequisites"]:
+                            a8_error = {
+                                "code": "A8",
+                                "description": f"Phase {detected_phase_number} started before Phase {prereq['phase']} prerequisites satisfied",
+                                "severity": "HIGH",
+                                "blocking_checkpoints": prereq["blocking_checkpoints"]
+                            }
+                            error_codes.append(a8_error)
+                            
+                            logger.error(
+                                "a8_operation_omitted_detected",
+                                session_id=self.session_id,
+                                current_phase=detected_phase_number,
+                                prerequisite_phase=prereq['phase'],
+                                missing_checkpoints=prereq["blocking_checkpoints"],
+                                evidence="Backend prerequisite validation"
+                            )
                 
                 logger.info(
                     "outlier_analysis_parsed",

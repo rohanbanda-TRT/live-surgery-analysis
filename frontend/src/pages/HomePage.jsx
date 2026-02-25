@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom';
-import { Video, Activity, FileText } from 'lucide-react';
+import { Video, Activity, FileText, GitCompare } from 'lucide-react';
 
 function HomePage() {
   return (
@@ -13,7 +13,7 @@ function HomePage() {
         </p>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-12">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mt-12">
         {/* Video Analysis Card */}
         <Link
           to="/analyze"
@@ -43,6 +43,22 @@ function HomePage() {
           </h3>
           <p className="text-gray-600">
             Monitor live surgeries in real-time with AI-powered step detection and compliance checking
+          </p>
+        </Link>
+
+        {/* Video Comparison Card */}
+        <Link
+          to="/compare"
+          className="bg-white rounded-lg shadow-md p-6 hover:shadow-lg transition-shadow"
+        >
+          <div className="flex items-center justify-center w-12 h-12 bg-orange-100 rounded-lg mb-4">
+            <GitCompare className="h-6 w-6 text-orange-600" />
+          </div>
+          <h3 className="text-lg font-semibold text-gray-900 mb-2">
+            Video Comparison
+          </h3>
+          <p className="text-gray-600">
+            Compare recorded videos against procedures with checkpoint validation and error detection
           </p>
         </Link>
 

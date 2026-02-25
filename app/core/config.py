@@ -60,7 +60,7 @@ class Settings(BaseSettings):
         return [fmt.strip() for fmt in self.ALLOWED_VIDEO_FORMATS_STR.split(',') if fmt.strip()]
 
     # Cloud Storage
-    GCS_BUCKET_NAME: str = "surgical-videos"
+    GCS_BUCKET_NAME: str = "pd-rag-bot"
 
     
     # WebSocket

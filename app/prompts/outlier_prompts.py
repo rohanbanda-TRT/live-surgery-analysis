@@ -180,13 +180,22 @@ Analyze this video chunk and provide:
    - Review the checkpoint requirements listed above for the current phase
    - For EACH requirement, verify if it is satisfied in the video
    - **BLOCKING checkpoints MUST be satisfied before phase can progress**
-   - Report which requirements are MET and which are NOT MET
+   
+   **TEMPORAL VALIDATION RULES (CRITICAL FOR STABILITY):**
+   - If a checkpoint was MET in previous chunks and is NOT visible in current chunk, mark as "PREVIOUSLY_MET"
+   - Only mark as NOT MET if you observe active violation or reversal of the requirement
+   - Use evidence from RECENT ANALYSIS HISTORY to maintain temporal stability
+   - Camera angle changes do NOT invalidate previously satisfied checkpoints
+   - Example: "Coagulation Completed: PREVIOUSLY_MET - Not visible in current frame but was confirmed in chunk history"
+   
+   - Report which requirements are MET, NOT MET, or PREVIOUSLY_MET
    - Provide specific visual evidence for each checkpoint validation
    
    Example checkpoint validation:
    - "Anatomical Exposure Verified: MET - Clear view of mitral annulus visible"
    - "Leaflet Mobility Assessed: NOT MET - Leaflets not yet visible in frame"
-   - "Coagulation Completed: MET - Cautery marks visible on tissue edges"
+   - "Coagulation Completed: PREVIOUSLY_MET - Confirmed in chunk 3, not visible now due to camera angle"
+   - "Hemostasis Achieved: MET - No active bleeding visible"
 
 4. **PHASE COMPLETION LOGIC:**
    A phase can ONLY be marked as "completed" if:
@@ -199,10 +208,21 @@ Analyze this video chunk and provide:
    - List which checkpoints are blocking completion
    - Specify what needs to be observed to satisfy them
 
-5. **OMISSION DETECTION (Error A8):**
-   - Was vessel coagulation performed before tissue manipulation?
-   - Was fluoroscopy verification done when required?
-   - Are critical steps being skipped?
+5. **OMISSION DETECTION (Error A8 - CRITICAL):**
+   **Before marking a phase as detected, verify prerequisites are satisfied:**
+   - Review DETECTED PHASES section to check if prerequisite phases have completed checkpoints
+   - If current phase requires prior checkpoint completion, verify it was done
+   
+   **Common A8 violations to detect:**
+   - Phase 3.3 (tissue manipulation) detected but Phase 3.2 (coagulation) checkpoints NOT MET
+   - Phase 3.7 (closure) detected but Phase 3.6 (verification) checkpoints NOT MET
+   - Fluoroscopy/imaging verification omitted before proceeding to next phase
+   - Vessel coagulation not performed before tissue manipulation
+   
+   **If prerequisites are missing:**
+   - Report A8 error with specific omitted phase and checkpoint
+   - Format: "A8 - Phase 3.2 Coagulation checkpoint 'Vessel sealed' not satisfied before Phase 3.3"
+   - Mark as HIGH severity
 
 **CRITICAL RULES:**
 - Once a phase is detected, it remains in the cumulative detected list
@@ -218,7 +238,7 @@ Detected Phase: [phase_number or null]
 Matches Expected: [YES/NO]
 Error Codes Detected: [list of codes or "None"]
 Checkpoint Status: [PASS/FAIL]
-Checkpoint Details: [For each checkpoint requirement: "Requirement name: MET/NOT MET - Evidence"]
+Checkpoint Details: [For each checkpoint requirement: "Requirement name: MET/NOT MET/PREVIOUSLY_MET - Evidence"]
 Step Progress: [in-progress/completed/not-started]
 Completion Evidence: [specific observations - only if ALL checkpoints PASS]
 Block Progression: [YES/NO with reason - YES if BLOCKING checkpoints not met]
