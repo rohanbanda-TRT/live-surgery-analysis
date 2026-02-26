@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     
     # Google Cloud
     GOOGLE_CLOUD_PROJECT: str = "nins-dev"
-    GOOGLE_APPLICATION_CREDENTIALS: str = Field(default="/home/com-028/Desktop/TRT/PROJ/files/surgical-analysis-platform/nins-dev-caec10880a35.json")
+    GOOGLE_APPLICATION_CREDENTIALS: str = Field(default="nins-dev-caec10880a35.json")
     VERTEX_AI_LOCATION: str = "us-central1"
     
     # Gemini API
