@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react';
 import { Video, CheckCircle, XCircle, AlertTriangle, Upload, Loader } from 'lucide-react';
 import { proceduresAPI, outlierProceduresAPI } from '../services/api';
 
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'https://surgery-analysis-api.demotrt.com';
+
 function RecordedVideoComparisonPage() {
   const [inputMode, setInputMode] = useState('url'); // 'url' or 'upload'
   const [videoUrl, setVideoUrl] = useState('');
@@ -83,7 +85,7 @@ function RecordedVideoComparisonPage() {
       const formData = new FormData();
       formData.append('file', selectedFile);
 
-      const response = await fetch('/api/procedures/upload-video', {
+      const response = await fetch(`${API_BASE_URL}/api/procedures/upload-video`, {
         method: 'POST',
         body: formData
       });
@@ -148,7 +150,7 @@ function RecordedVideoComparisonPage() {
         requestBody.video_duration_sec = videoDuration;
       }
 
-      const response = await fetch('/api/procedures/compare-chunked', {
+      const response = await fetch(`${API_BASE_URL}/api/procedures/compare-chunked`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody)
