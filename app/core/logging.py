@@ -1,6 +1,9 @@
 """
 Structured logging configuration using structlog.
 """
+from dotenv import load_dotenv
+load_dotenv()
+
 import structlog
 import logging
 import sys

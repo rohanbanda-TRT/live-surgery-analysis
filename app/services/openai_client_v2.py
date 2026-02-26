@@ -19,6 +19,9 @@ Cost vs Gemini 2.5 Flash (7 frames, detail:low, ~200 token JSON output):
   gpt-4o        : ~$0.003/chunk   → ~$1.55/hour at 1 FPS
   gemini-2.5-fl : ~$0.0007/chunk  → ~$0.36/hour at 1 FPS
 """
+from dotenv import load_dotenv
+load_dotenv()
+
 from openai import AsyncOpenAI
 from typing import Optional, List, Any
 import base64

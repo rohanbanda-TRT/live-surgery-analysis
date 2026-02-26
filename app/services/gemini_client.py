@@ -1,6 +1,9 @@
 """
 Gemini API client for video analysis using Vertex AI.
 """
+from dotenv import load_dotenv
+load_dotenv()
+
 from google import genai
 from google.genai.types import HttpOptions, Part, GenerateContentConfig, VideoMetadata
 from typing import Optional, Dict, Any, List

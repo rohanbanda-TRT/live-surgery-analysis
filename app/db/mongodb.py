@@ -2,6 +2,9 @@
 MongoDB database connection and management using PyMongo Async API.
 Note: Motor is deprecated as of May 2025, using PyMongo Async API instead.
 """
+from dotenv import load_dotenv
+load_dotenv()
+
 from pymongo.asynchronous.mongo_client import AsyncMongoClient
 from pymongo.asynchronous.database import AsyncDatabase
 from typing import Optional

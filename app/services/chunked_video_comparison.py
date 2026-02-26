@@ -28,7 +28,8 @@ from google.cloud import storage
 from app.services.gemini_client import GeminiClient
 from app.services.recorded_video_comparison import RecordedVideoComparisonService
 from app.core.logging import logger
-
+from dotenv import load_dotenv
+load_dotenv()
 # ── Chunking configuration ──────────────────────────────────
 CHUNK_DURATION_SEC = 20 * 60       # 20 minutes per chunk
 OVERLAP_SEC = 60                    # 60 seconds overlap between chunks

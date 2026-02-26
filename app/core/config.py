@@ -1,6 +1,9 @@
 """
 Application configuration management using Pydantic Settings.
 """
+from dotenv import load_dotenv
+load_dotenv()
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator, computed_field
 from typing import List

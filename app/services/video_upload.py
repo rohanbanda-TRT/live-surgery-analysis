@@ -1,6 +1,9 @@
 """
 Video upload service for uploading videos to Google Cloud Storage.
 """
+from dotenv import load_dotenv
+load_dotenv()
+
 from google.cloud import storage
 from datetime import datetime, timezone
 import uuid
