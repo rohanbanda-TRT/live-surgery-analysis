@@ -9,7 +9,9 @@ from app.core.config import settings
 from app.core.logging import logger
 from app.db.mongodb import MongoDB
 from app.db.collections import create_indexes
-from app.api.routes import procedures, sessions, health
+from app.api.routes import procedures, sessions, health, outlier_procedures
+from app.api.routes import sessions_v2
+from app.api.routes import sessions_v3
 
 
 @asynccontextmanager
@@ -58,7 +60,10 @@ app.add_middleware(
 # Include routers
 app.include_router(health.router, prefix="/api", tags=["health"])
 app.include_router(procedures.router, prefix="/api/procedures", tags=["procedures"])
+app.include_router(outlier_procedures.router, prefix="/api/outlier-procedures", tags=["outlier-procedures"])
 app.include_router(sessions.router, prefix="/api/sessions", tags=["sessions"])
+app.include_router(sessions_v2.router, prefix="/api/sessions-v2", tags=["sessions-v2"])
+app.include_router(sessions_v3.router, prefix="/api/sessions-v3", tags=["sessions-v3"])
 
 
 @app.get("/")

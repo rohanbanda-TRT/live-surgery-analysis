@@ -2,11 +2,12 @@
 Gemini API client for video analysis using Vertex AI.
 """
 from google import genai
-from google.genai.types import HttpOptions, Part, GenerateContentConfig
+from google.genai.types import HttpOptions, Part, GenerateContentConfig, VideoMetadata
 from typing import Optional, Dict, Any, List
 import json
 import re
 import httpx
+import asyncio
 
 from app.core.config import settings
 from app.core.logging import logger
@@ -210,6 +211,118 @@ class GeminiClient:
             )
             raise
     
+    async def analyze_video_clipped(
+        self,
+        video_gs_uri: str,
+        prompt: str,
+        start_offset_sec: float,
+        end_offset_sec: float,
+        temperature: Optional[float] = None,
+        response_schema: Optional[Dict[str, Any]] = None,
+        max_retries: int = 3,
+    ) -> str:
+        """
+        Analyze a time-clipped segment of a video from GCS using VideoMetadata.
+
+        Uses Gemini's native clipping — the full video stays in GCS and only
+        the [start_offset, end_offset] window is processed.
+
+        Includes exponential backoff retry logic for rate limit errors (429).
+
+        Args:
+            video_gs_uri: GCS URI of the video
+            prompt: Text prompt for analysis
+            start_offset_sec: Start time in seconds
+            end_offset_sec: End time in seconds
+            temperature: Model temperature
+            response_schema: Optional JSON schema for structured output
+            max_retries: Maximum retry attempts for rate limit errors
+
+        Returns:
+            Analysis result as text or JSON string
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                logger.info(
+                    "analyzing_video_clipped",
+                    video_uri=video_gs_uri,
+                    start_sec=start_offset_sec,
+                    end_sec=end_offset_sec,
+                    duration_sec=end_offset_sec - start_offset_sec,
+                    model=self.model,
+                    attempt=attempt + 1,
+                    max_retries=max_retries + 1,
+                )
+
+                # Build Part with VideoMetadata clipping offsets
+                video_part = Part(
+                    file_data={"file_uri": video_gs_uri, "mime_type": "video/mp4"},
+                    video_metadata=VideoMetadata(
+                        start_offset=f"{start_offset_sec}s",
+                        end_offset=f"{end_offset_sec}s",
+                    ),
+                )
+
+                contents = [video_part, prompt]
+
+                config = GenerateContentConfig(
+                    temperature=temperature or self.temperature,
+                    response_mime_type="application/json" if response_schema else "text/plain",
+                    response_schema=response_schema,
+                )
+
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=contents,
+                    config=config,
+                )
+
+                result = response.text
+                logger.info(
+                    "video_clipped_analysis_completed",
+                    video_uri=video_gs_uri,
+                    start_sec=start_offset_sec,
+                    end_sec=end_offset_sec,
+                    response_length=len(result),
+                    attempt=attempt + 1,
+                )
+                return result
+
+            except Exception as e:
+                error_str = str(e)
+                is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+                is_unavailable = "503" in error_str or "UNAVAILABLE" in error_str
+                is_retryable = is_rate_limit or is_unavailable
+
+                if is_retryable and attempt < max_retries:
+                    # Exponential backoff: 5s, 15s, 45s
+                    wait_time = 5 * (3 ** attempt)
+                    error_type = "rate_limit" if is_rate_limit else "service_unavailable"
+                    logger.warning(
+                        f"video_clipped_{error_type}_retry",
+                        video_uri=video_gs_uri,
+                        start_sec=start_offset_sec,
+                        end_sec=end_offset_sec,
+                        attempt=attempt + 1,
+                        max_retries=max_retries + 1,
+                        wait_seconds=wait_time,
+                        error=error_str,
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                logger.error(
+                    "video_clipped_analysis_failed",
+                    video_uri=video_gs_uri,
+                    start_sec=start_offset_sec,
+                    end_sec=end_offset_sec,
+                    error=error_str,
+                    is_rate_limit=is_rate_limit,
+                    is_unavailable=is_unavailable,
+                    attempt=attempt + 1,
+                )
+                raise
+
     async def analyze_video_with_structured_output(
         self,
         video_gs_uri: str,
@@ -255,6 +368,141 @@ class GeminiClient:
         
         return parsed_result
     
+    async def generate_content(
+        self,
+        prompt: str,
+        temperature: Optional[float] = None,
+        response_mime_type: str = "text/plain"
+    ) -> str:
+        """
+        Generate content from text-only prompt.
+        
+        Used for document parsing and text-based tasks.
+        
+        Args:
+            prompt: Text prompt
+            temperature: Model temperature
+            response_mime_type: Response format ("text/plain" or "application/json")
+            
+        Returns:
+            Generated content as string
+        """
+        try:
+            logger.info(
+                "generating_content",
+                prompt_length=len(prompt),
+                response_type=response_mime_type
+            )
+            
+            # Configure generation
+            config = GenerateContentConfig(
+                temperature=temperature if temperature is not None else self.temperature,
+                response_mime_type=response_mime_type
+            )
+            
+            # Generate content
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=config
+            )
+            
+            logger.info(
+                "content_generated",
+                response_length=len(response.text)
+            )
+            
+            return response.text
+            
+        except Exception as e:
+            logger.error(
+                "content_generation_failed",
+                error=str(e)
+            )
+            raise
+    
+    async def analyze_frames_structured(
+        self,
+        frames: List[bytes],
+        prompt: str,
+        response_schema: dict,
+        system_instruction: Optional[str] = None,
+        temperature: Optional[float] = None,
+    ) -> dict:
+        """
+        Analyze multiple frames with structured JSON output.
+
+        Sends each frame as an individual image/jpeg part — no ffmpeg needed.
+        Used by V2 live surgery pipeline for chunk-based analysis.
+
+        Args:
+            frames: List of JPEG frame bytes
+            prompt: Dynamic prompt (chunk-specific context)
+            response_schema: Pydantic .model_json_schema() dict
+            system_instruction: Static context (procedure info, set once per session)
+            temperature: Override temperature
+
+        Returns:
+            Parsed JSON dict matching the response_schema
+        """
+        try:
+            # Build content parts: images first, then text prompt
+            contents = []
+            for i, frame_data in enumerate(frames):
+                contents.append(
+                    Part.from_bytes(data=frame_data, mime_type="image/jpeg")
+                )
+            contents.append(prompt)
+
+            # Configure generation with structured JSON output
+            config = GenerateContentConfig(
+                temperature=temperature if temperature is not None else self.temperature,
+                response_mime_type="application/json",
+                response_json_schema=response_schema,
+            )
+            if system_instruction:
+                config.system_instruction = system_instruction
+
+            logger.info(
+                "analyzing_frames_structured",
+                frame_count=len(frames),
+                model=self.model,
+                prompt_length=len(prompt),
+                has_system_instruction=bool(system_instruction),
+            )
+
+            # Generate content (sync call — google-genai handles async internally)
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=config,
+            )
+
+            # Parse JSON — guaranteed valid by response_json_schema
+            result = json.loads(response.text)
+
+            logger.info(
+                "frames_analysis_completed",
+                frame_count=len(frames),
+                response_keys=list(result.keys()),
+            )
+            return result
+
+        except json.JSONDecodeError as e:
+            logger.error(
+                "structured_output_json_parse_failed",
+                error=str(e),
+                response_preview=response.text[:500] if response else "N/A",
+            )
+            raise
+        except Exception as e:
+            logger.error(
+                "frames_analysis_failed",
+                frame_count=len(frames),
+                error=str(e),
+            )
+            raise
+
     async def analyze_frame(
         self,
         frame_data: bytes,

@@ -4,6 +4,7 @@ import HomePage from './pages/HomePage';
 import VideoAnalysisPage from './pages/VideoAnalysisPage';
 import LiveMonitoringPage from './pages/LiveMonitoringPage';
 import ProceduresPage from './pages/ProceduresPage';
+import RecordedVideoComparisonPage from './pages/RecordedVideoComparisonPage';
 
 function App() {
   return (
@@ -46,6 +47,12 @@ function App() {
                 >
                   Live Monitoring
                 </Link>
+                <Link
+                  to="/compare"
+                  className="inline-flex items-center px-1 pt-1 text-sm font-medium text-gray-500 hover:text-primary-600"
+                >
+                  Video Comparison
+                </Link>
               </div>
             </div>
           </div>
@@ -58,6 +65,7 @@ function App() {
             <Route path="/procedures" element={<ProceduresPage />} />
             <Route path="/analyze" element={<VideoAnalysisPage />} />
             <Route path="/live" element={<LiveMonitoringPage />} />
+            <Route path="/compare" element={<RecordedVideoComparisonPage />} />
           </Routes>
         </main>
       </div>

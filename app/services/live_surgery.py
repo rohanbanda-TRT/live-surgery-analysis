@@ -10,8 +10,11 @@ import cv2
 import numpy as np
 
 from app.services.gemini_client import GeminiClient
-from app.db.collections import MASTER_PROCEDURES, SURGICAL_STEPS, LIVE_SESSIONS, SESSION_ALERTS
+from app.db.collections import MASTER_PROCEDURES, SURGICAL_STEPS, LIVE_SESSIONS, SESSION_ALERTS, OUTLIER_PROCEDURES
 from app.core.logging import logger
+from app.prompts.outlier_prompts import get_outlier_chunk_analysis_prompt
+from app.prompts.standard_prompts import get_standard_chunk_analysis_prompt
+from app.services.outlier_analysis import OutlierAnalysisParser, CheckpointTracker
 
 
 class LiveSurgeryService:
@@ -31,6 +34,8 @@ class LiveSurgeryService:
         
         # Session state
         self.master_procedure: Optional[Dict[str, Any]] = None
+        self.outlier_procedure: Optional[Dict[str, Any]] = None  # For outlier resolution mode
+        self.procedure_source: str = "standard"  # "standard" or "outlier"
         self.procedure_steps: List[Dict[str, Any]] = []
         self.current_step_index: int = 0
         self.session_doc_id: Optional[ObjectId] = None
@@ -45,6 +50,11 @@ class LiveSurgeryService:
         self.detected_steps_cumulative: set = set()  # Steps that have been detected (NEVER removed)
         self.step_status: Dict[int, str] = {}  # step_index -> status (pending/detected/missed)
         self.step_detection_history: Dict[int, List[str]] = {}  # step_index -> list of detection analyses
+        self.phase_number_to_index: Dict[str, int] = {}  # For outlier mode: phase_number -> index mapping
+        
+        # Outlier mode: checkpoint tracking
+        self.checkpoint_tracker: Optional[CheckpointTracker] = None
+        self.outlier_parser = OutlierAnalysisParser()
         
         # Video chunk processing
         self.frame_buffer: List[bytes] = []
@@ -61,6 +71,7 @@ class LiveSurgeryService:
         self,
         procedure_id: str,
         surgeon_id: str,
+        procedure_source: str = "standard",
         alert_callback: Optional[Callable] = None,
         analysis_callback: Optional[Callable] = None
     ):
@@ -68,8 +79,9 @@ class LiveSurgeryService:
         Start a new live surgery monitoring session.
         
         Args:
-            procedure_id: ID of the master procedure
+            procedure_id: ID of the master procedure or outlier procedure
             surgeon_id: ID of the surgeon
+            procedure_source: "standard" for master_procedures, "outlier" for outlier_procedures
             alert_callback: Callback for sending alerts
             analysis_callback: Callback for sending real-time analysis updates
         """
@@ -78,23 +90,75 @@ class LiveSurgeryService:
             self.is_processing_chunks = True
             self.chunk_task = asyncio.create_task(self._process_chunk_queue())
             
+            self.procedure_source = procedure_source
+            
             logger.info(
                 "starting_live_session",
                 session_id=self.session_id,
                 procedure_id=procedure_id,
-                surgeon_id=surgeon_id
+                surgeon_id=surgeon_id,
+                procedure_source=procedure_source
             )
             
-            # Load master procedure with embedded steps
-            self.master_procedure = await self.db[MASTER_PROCEDURES].find_one(
-                {"_id": ObjectId(procedure_id)}
-            )
-            
-            if not self.master_procedure:
-                raise ValueError(f"Master procedure {procedure_id} not found")
-            
-            # Get steps from embedded array
-            self.procedure_steps = self.master_procedure.get("steps", [])
+            # Load procedure based on source type
+            if procedure_source == "outlier":
+                # Load outlier resolution procedure
+                self.outlier_procedure = await self.db[OUTLIER_PROCEDURES].find_one(
+                    {"_id": ObjectId(procedure_id)}
+                )
+                
+                if not self.outlier_procedure:
+                    raise ValueError(f"Outlier procedure {procedure_id} not found")
+                
+                # Convert outlier phases to steps format for compatibility
+                # IMPORTANT: Use phase_number as the primary identifier, not sequential index
+                self.procedure_steps = [
+                    {
+                        "step_number": phase["phase_number"],  # Use actual phase number (3.1, 3.2, etc.)
+                        "step_name": phase["phase_name"],
+                        "description": phase["goal"],
+                        "is_critical": phase["priority"] == "HIGH",
+                        "phase_number": phase["phase_number"],
+                        "phase_index": i  # Keep index for array access
+                    }
+                    for i, phase in enumerate(self.outlier_procedure.get("phases", []))
+                ]
+                
+                # Create phase_number to index mapping for quick lookup
+                self.phase_number_to_index = {
+                    phase["phase_number"]: i 
+                    for i, phase in enumerate(self.outlier_procedure.get("phases", []))
+                }
+                
+                # Initialize checkpoint tracker for outlier mode
+                self.checkpoint_tracker = CheckpointTracker()
+                for phase in self.outlier_procedure.get("phases", []):
+                    self.checkpoint_tracker.initialize_phase_checkpoints(phase)
+                
+                logger.info(
+                    "outlier_procedure_loaded",
+                    session_id=self.session_id,
+                    procedure_name=self.outlier_procedure.get("procedure_name"),
+                    phases_count=len(self.procedure_steps)
+                )
+            else:
+                # Load standard master procedure with embedded steps
+                self.master_procedure = await self.db[MASTER_PROCEDURES].find_one(
+                    {"_id": ObjectId(procedure_id)}
+                )
+                
+                if not self.master_procedure:
+                    raise ValueError(f"Master procedure {procedure_id} not found")
+                
+                # Get steps from embedded array
+                self.procedure_steps = self.master_procedure.get("steps", [])
+                
+                logger.info(
+                    "master_procedure_loaded",
+                    session_id=self.session_id,
+                    procedure_name=self.master_procedure.get("procedure_name"),
+                    steps_count=len(self.procedure_steps)
+                )
             
             # Initialize all steps as pending
             for i in range(len(self.procedure_steps)):
@@ -105,6 +169,11 @@ class LiveSurgeryService:
             self.step_detection_history.clear()
             
             # Create session document
+            procedure_name = (
+                self.outlier_procedure.get("procedure_name") if self.procedure_source == "outlier"
+                else self.master_procedure.get("procedure_name")
+            )
+            
             session_doc = {
                 "session_id": self.session_id,
                 "procedure_id": ObjectId(procedure_id),
@@ -113,8 +182,9 @@ class LiveSurgeryService:
                 "end_time": None,
                 "current_step": 0,
                 "status": "active",
+                "procedure_source": self.procedure_source,
                 "metadata": {
-                    "procedure_name": self.master_procedure.get("procedure_name"),
+                    "procedure_name": procedure_name,
                     "total_steps": len(self.procedure_steps)
                 }
             }
@@ -340,52 +410,38 @@ class LiveSurgeryService:
                     history_lines.append(f"  {matches}")
                 history_context = f"\n**Analysis History (Last {len(recent_history)} chunks):**\n" + "\n".join(history_lines) + "\n"
             
-            # Build detailed current step context from master procedure
-            current_step_detail = f"""
-**Current Expected Step {current_step.get('step_number', self.current_step_index + 1)}: {current_step['step_name']}**
-- Description: {current_step.get('description', 'N/A')}
-- Expected Duration: {current_step.get('expected_duration_min', 'N/A')}-{current_step.get('expected_duration_max', 'N/A')} minutes
-- Critical Step: {'YES - Extra caution required' if current_step.get('is_critical') else 'No'}
-- Required Instruments: {', '.join(current_step.get('instruments_required', [])) or 'Not specified'}
-- Anatomical Landmarks: {', '.join(current_step.get('anatomical_landmarks', [])) or 'Not specified'}
-- Visual Cues: {current_step.get('visual_cues', 'Not specified')}
-"""
-            
-            # Enhanced prompt with master procedure alignment
-            prompt = f"""Analyze this {len(chunk_data['frames'])}-second surgical video clip from {self.master_procedure.get('procedure_name')}.
-
-**MASTER PROCEDURE CONTEXT:**
-{current_step_detail}
-
-**DETECTED STEPS (CUMULATIVE - ALREADY IDENTIFIED):** 
-{detected_context}
-{cumulative_note}
-**REMAINING STEPS (FOCUS ON DETECTING THESE):** 
-{remaining_context}
-{history_context}
-**CRITICAL RULES - CUMULATIVE TRACKING:**
-1. This is CUMULATIVE analysis - once a step is detected, it REMAINS detected forever
-2. **FOCUS ONLY on remaining steps** - detected steps are already confirmed
-3. Compare video against the MASTER PROCEDURE definition above
-4. Steps take MINUTES (50-200+ frames at 1 FPS), not seconds
-5. Mark "completed" ONLY when you see clear evidence the step description is fulfilled
-6. "in-progress" is default - be conservative
-7. Verify actual surgical actions match the step description, not just instrument presence
-8. Review analysis history and master procedure definition before making status updates
-9. Match visible instruments and anatomical landmarks against requirements
-10. **DO NOT re-detect already detected steps** - they remain in the detected list automatically
-
-**RESPONSE FORMAT:**
-Detected Step: [number] - [name]
-Action Being Performed: [what surgeon is doing - compare to step description]
-Instruments Visible: [list - compare to required instruments]
-Anatomical Landmarks: [list - compare to expected landmarks]
-Matches Expected: [yes/no - does video match master procedure definition?]
-Step Progress: [just-started/in-progress/nearing-completion/completed]
-Completion Evidence: [required if completed - what proves step description is fulfilled? else "N/A"]
-Analysis: [brief observation comparing video to master procedure]
-
-Analyze the video clip and respond:"""
+            # Build prompt based on procedure source
+            if self.procedure_source == "outlier":
+                # Use outlier resolution prompt with error detection
+                remaining_phases = [
+                    phase for i, phase in enumerate(self.outlier_procedure.get('phases', []))
+                    if i not in self.detected_steps_cumulative
+                ]
+                
+                detected_phase_numbers = {
+                    self.procedure_steps[i].get('phase_number') 
+                    for i in self.detected_steps_cumulative
+                }
+                
+                prompt = get_outlier_chunk_analysis_prompt(
+                    outlier_procedure=self.outlier_procedure,
+                    detected_phases=detected_phase_numbers,
+                    remaining_phases=remaining_phases,
+                    chunk_history=self.chunk_history
+                )
+            else:
+                # Use standard prompt for master procedures
+                procedure_name = self.master_procedure.get('procedure_name') if self.master_procedure else 'Unknown Procedure'
+                
+                prompt = get_standard_chunk_analysis_prompt(
+                    procedure_name=procedure_name,
+                    current_step=current_step,
+                    detected_context=detected_context,
+                    remaining_context=remaining_context,
+                    history_context=history_context,
+                    cumulative_note=cumulative_note,
+                    chunk_duration=len(chunk_data['frames'])
+                )
             
             logger.info(
                 "chunk_prompt_built",
@@ -434,11 +490,70 @@ Analyze the video clip and respond:"""
     ):
         """Process analysis response using cumulative step tracking (like reference implementation)."""
         try:
-            # Parse AI response
-            detected_step_index = self._parse_detected_step(analysis)
+            # Increment chunk counter for history tracking
+            if self.procedure_source == "outlier" and self.checkpoint_tracker:
+                self.checkpoint_tracker.increment_chunk_counter()
+            
+            # Parse AI response differently for outlier vs standard mode
+            if self.procedure_source == "outlier":
+                # For outlier mode: parse phase_number and checkpoint details
+                detected_phase_number = self.outlier_parser.parse_detected_phase(analysis)
+                checkpoint_status = self.outlier_parser.parse_checkpoint_status(analysis)
+                error_codes = self.outlier_parser.parse_error_codes(analysis)
+                step_progress = self.outlier_parser.parse_step_progress(analysis)
+                completion_evidence = self.outlier_parser.parse_completion_evidence(analysis)
+                
+                # Convert phase_number to index for cumulative tracking
+                detected_step_index = self.phase_number_to_index.get(detected_phase_number) if detected_phase_number else None
+                
+                # Update checkpoint tracker if we have checkpoint details
+                if detected_phase_number and checkpoint_status.get("details"):
+                    self.checkpoint_tracker.update_from_ai_checkpoint_details(
+                        detected_phase_number,
+                        checkpoint_status["details"]
+                    )
+                
+                # CRITICAL: A8 (Operation Omitted) Detection via prerequisite validation
+                if detected_phase_number and self.checkpoint_tracker:
+                    eligibility = self.checkpoint_tracker.is_phase_eligible(detected_phase_number)
+                    
+                    if not eligibility["eligible"]:
+                        # Phase detected but prerequisites not satisfied = A8 error
+                        for prereq in eligibility["blocking_prerequisites"]:
+                            a8_error = {
+                                "code": "A8",
+                                "description": f"Phase {detected_phase_number} started before Phase {prereq['phase']} prerequisites satisfied",
+                                "severity": "HIGH",
+                                "blocking_checkpoints": prereq["blocking_checkpoints"]
+                            }
+                            error_codes.append(a8_error)
+                            
+                            logger.error(
+                                "a8_operation_omitted_detected",
+                                session_id=self.session_id,
+                                current_phase=detected_phase_number,
+                                prerequisite_phase=prereq['phase'],
+                                missing_checkpoints=prereq["blocking_checkpoints"],
+                                evidence="Backend prerequisite validation"
+                            )
+                
+                logger.info(
+                    "outlier_analysis_parsed",
+                    session_id=self.session_id,
+                    detected_phase=detected_phase_number,
+                    checkpoint_status=checkpoint_status.get("status"),
+                    error_count=len(error_codes),
+                    step_progress=step_progress
+                )
+            else:
+                # For standard mode: parse step index as before
+                detected_step_index = self._parse_detected_step(analysis)
+                checkpoint_status = None
+                error_codes = []
+                step_progress = self._parse_step_progress(analysis)
+                completion_evidence = self._parse_completion_evidence(analysis)
+            
             matches_expected = "yes" in analysis.lower() and "matches expected: yes" in analysis.lower()
-            step_progress = self._parse_step_progress(analysis)
-            completion_evidence = self._parse_completion_evidence(analysis)
             
             # Log current state before processing
             logger.info(
@@ -514,36 +629,125 @@ Analyze the video clip and respond:"""
                     )
                     current_step_for_display = self.procedure_steps[next_undetected_index]
                     
+                    # Build all_steps with checkpoint information for outlier mode
+                    all_steps_data = []
+                    
+                    logger.info(
+                        "building_analysis_callback_data",
+                        session_id=self.session_id,
+                        procedure_source=self.procedure_source,
+                        total_steps=len(self.procedure_steps),
+                        detected_cumulative=list(self.detected_steps_cumulative)
+                    )
+                    
+                    for i, s in enumerate(self.procedure_steps):
+                        step_data = {
+                            "step_number": s.get('step_number', i+1),
+                            "step_name": s['step_name'],
+                            "description": s.get('description'),
+                            "is_critical": s.get('is_critical', False),
+                            "detected": i in self.detected_steps_cumulative
+                        }
+                        
+                        # For outlier mode, add checkpoint and phase-specific data
+                        if self.procedure_source == "outlier":
+                            phase_number = s.get('phase_number')
+                            phase = self.outlier_procedure['phases'][i] if i < len(self.outlier_procedure.get('phases', [])) else {}
+                            
+                            logger.debug(
+                                "building_phase_data",
+                                session_id=self.session_id,
+                                phase_index=i,
+                                phase_number=phase_number,
+                                phase_name=phase.get('phase_name'),
+                                has_phase_data=bool(phase)
+                            )
+                            
+                            # Get checkpoint status for this phase
+                            checkpoint_info = self.checkpoint_tracker.get_phase_checkpoint_status(phase_number) if self.checkpoint_tracker else {}
+                            
+                            logger.debug(
+                                "checkpoint_info_retrieved",
+                                session_id=self.session_id,
+                                phase_number=phase_number,
+                                has_checkpoints=checkpoint_info.get('has_checkpoints'),
+                                all_complete=checkpoint_info.get('all_complete'),
+                                checkpoint_count=len(checkpoint_info.get('checkpoints', []))
+                            )
+                            
+                            # Determine phase status based on checkpoints
+                            if i in self.detected_steps_cumulative:
+                                # Phase is detected, check if checkpoints are complete
+                                if checkpoint_info.get('has_checkpoints'):
+                                    if checkpoint_info.get('all_complete'):
+                                        phase_status = "completed"
+                                    else:
+                                        # Check if there are blocking checkpoints
+                                        blocking_checkpoints = self.checkpoint_tracker.get_blocking_checkpoints(phase_number) if self.checkpoint_tracker else []
+                                        phase_status = "blocked" if blocking_checkpoints else "current"
+                                else:
+                                    # No checkpoints, phase is completed when detected
+                                    phase_status = "completed"
+                            else:
+                                phase_status = self.step_status.get(i, "pending")
+                            
+                            step_data.update({
+                                "phase_number": phase_number,
+                                "phase_name": phase.get('phase_name'),  # Add phase_name explicitly
+                                "goal": phase.get('goal'),
+                                "priority": phase.get('priority'),
+                                "status": phase_status,
+                                "checkpoints": checkpoint_info.get('checkpoints', []),
+                                "detected_errors": error_codes if i == detected_step_index else []
+                            })
+                            
+                            logger.info(
+                                "phase_data_built",
+                                session_id=self.session_id,
+                                phase_index=i,
+                                phase_number=phase_number,
+                                phase_name=step_data.get('phase_name'),
+                                status=phase_status,
+                                checkpoint_count=len(step_data.get('checkpoints', []))
+                            )
+                        else:
+                            # Standard mode status
+                            step_data["status"] = (
+                                "completed" if i in self.detected_steps_cumulative
+                                else self.step_status.get(i, "pending")
+                            )
+                        
+                        all_steps_data.append(step_data)
+                    
+                    logger.info(
+                        "all_steps_data_complete",
+                        session_id=self.session_id,
+                        total_phases=len(all_steps_data),
+                        sample_phase=all_steps_data[0] if all_steps_data else None
+                    )
+                    
                     analysis_data = {
                         "frame_count": frame_info["end_frame"],
                         "current_step_index": next_undetected_index,
                         "current_step_name": current_step_for_display['step_name'],
                         "detected_step_index": detected_step_index,
                         "matches_expected": matches_expected,
+                        "procedure_source": self.procedure_source,
                         "expected_step": {
                             "step_number": current_step_for_display.get('step_number'),
                             "step_name": current_step_for_display['step_name'],
                             "description": current_step_for_display.get('description'),
                             "is_critical": current_step_for_display.get('is_critical', False)
                         },
-                        "all_steps": [
-                            {
-                                "step_number": s.get('step_number', i+1),
-                                "step_name": s['step_name'],
-                                "description": s.get('description'),
-                                "is_critical": s.get('is_critical', False),
-                                # Map internal status to frontend-compatible values
-                                "status": (
-                                    "completed" if i in self.detected_steps_cumulative
-                                    else self.step_status.get(i, "pending")
-                                ),
-                                "detected": i in self.detected_steps_cumulative
-                            }
-                            for i, s in enumerate(self.procedure_steps)
-                        ],
+                        "all_steps": all_steps_data,
                         "analysis_text": analysis,
                         "timestamp": datetime.utcnow().isoformat()
                     }
+                    
+                    # Add outlier-specific data
+                    if self.procedure_source == "outlier" and checkpoint_status:
+                        analysis_data["checkpoint_status"] = checkpoint_status
+                    
                     await self.analysis_callback(analysis_data)
                 except Exception as callback_error:
                     # WebSocket may be closed - log but don't fail processing
@@ -628,8 +832,13 @@ Analyze the video clip and respond:"""
             
             # Prepare detailed analysis prompt with completed steps awareness
             # IMPORTANT: This matches the strict Live API format for consistency
+            procedure_name = (
+                self.outlier_procedure.get('procedure_name') if self.procedure_source == "outlier"
+                else self.master_procedure.get('procedure_name')
+            )
+            
             prompt = f"""
-You are monitoring a live surgical procedure: {self.master_procedure.get('procedure_name')}
+You are monitoring a live surgical procedure: {procedure_name}
 
 **COMPLETED STEPS (DO NOT MATCH AGAINST THESE):**
 {completed_context}
@@ -910,6 +1119,27 @@ Analysis: [detailed observation - what is the surgeon doing RIGHT NOW?]
                 session_id=self.session_id,
                 error=str(e)
             )
+    
+    def _parse_detected_phase_number(self, analysis: str) -> Optional[str]:
+        """
+        Parse the detected phase number from AI analysis response (for outlier mode).
+        
+        Args:
+            analysis: AI analysis text
+            
+        Returns:
+            Phase number (e.g., "3.4") or None if not detected
+        """
+        try:
+            import re
+            # Look for "Detected Phase: [phase_number]" pattern
+            match = re.search(r'Detected Phase:\s*(\d+\.\d+)', analysis, re.IGNORECASE)
+            if match:
+                return match.group(1)
+            return None
+        except Exception as e:
+            logger.error("failed_to_parse_detected_phase", error=str(e))
+            return None
     
     def _parse_detected_step(self, analysis: str) -> Optional[int]:
         """

@@ -11,6 +11,9 @@ google-genai
 google-cloud-storage
 google-cloud-aiplatform
 
+# OpenAI
+openai
+
 # Data Validation & Settings
 pydantic
 pydantic-settings

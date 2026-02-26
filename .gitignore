@@ -78,3 +78,5 @@ temp/
 *.mkv
 
 references/
+node_modules
+package-lock.json

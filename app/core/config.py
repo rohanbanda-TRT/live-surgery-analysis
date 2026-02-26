@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     GEMINI_MODEL: str = "gemini-2.5-flash"
     GEMINI_TEMPERATURE: float = 0.1
     GEMINI_MAX_OUTPUT_TOKENS: int = 880192
+
+    # OpenAI API (for V3 pipeline)
+    OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-4.1-mini"  # cheapest vision model with structured output
+    OPENAI_TEMPERATURE: float = 0.1
     
     # Security
     SECRET_KEY: str
@@ -60,7 +65,7 @@ class Settings(BaseSettings):
         return [fmt.strip() for fmt in self.ALLOWED_VIDEO_FORMATS_STR.split(',') if fmt.strip()]
 
     # Cloud Storage
-    GCS_BUCKET_NAME: str = "surgical-videos"
+    GCS_BUCKET_NAME: str = "pd-rag-bot"
 
     
     # WebSocket

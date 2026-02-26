@@ -1,10 +1,13 @@
 import { useState, useEffect, useRef } from 'react';
 import { Play, Square, AlertCircle, CheckCircle } from 'lucide-react';
 import LiveSurgeryWebSocket from '../services/websocket';
-import { proceduresAPI } from '../services/api';
+import { proceduresAPI, outlierProceduresAPI } from '../services/api';
+import OutlierPhaseTracker from '../components/OutlierPhaseTracker';
 
 function LiveMonitoringPage() {
   const [procedures, setProcedures] = useState([]);
+  const [outlierProcedures, setOutlierProcedures] = useState([]);
+  const [analysisMode, setAnalysisMode] = useState('standard'); // 'standard' or 'error-resolution'
   const [selectedProcedure, setSelectedProcedure] = useState('');
   const [sessionId, setSessionId] = useState('');
   const [surgeonId, setSurgeonId] = useState('surgeon-001');
@@ -18,6 +21,7 @@ function LiveMonitoringPage() {
   const [allSteps, setAllSteps] = useState([]);
   const [availableCameras, setAvailableCameras] = useState([]);
   const [selectedCameraId, setSelectedCameraId] = useState('');
+  const [pipelineVersion, setPipelineVersion] = useState('v2');
   
   const wsRef = useRef(null);
   const videoRef = useRef(null);
@@ -27,6 +31,7 @@ function LiveMonitoringPage() {
   useEffect(() => {
     // Load procedures and cameras on mount
     loadProcedures();
+    loadOutlierProcedures();
     listAvailableCameras();
     
     return () => {
@@ -42,9 +47,19 @@ function LiveMonitoringPage() {
     try {
       const data = await proceduresAPI.getAll();
       setProcedures(data);
-      addMessage('info', 'Procedures loaded successfully');
+      addMessage('info', 'Standard procedures loaded successfully');
     } catch (error) {
       addMessage('error', `Failed to load procedures: ${error.message}`);
+    }
+  };
+
+  const loadOutlierProcedures = async () => {
+    try {
+      const data = await outlierProceduresAPI.getAll();
+      setOutlierProcedures(data);
+      addMessage('info', 'Error resolution protocols loaded successfully');
+    } catch (error) {
+      addMessage('error', `Failed to load error resolution protocols: ${error.message}`);
     }
   };
 
@@ -111,6 +126,12 @@ function LiveMonitoringPage() {
       wsRef.current = new LiveSurgeryWebSocket();
       
       wsRef.current.onMessage((data) => {
+        if (data.error) {
+          addMessage('error', data.error);
+          setIsConnected(false);
+          return;
+        }
+        
         if (data.type === 'session_started') {
           setSessionInfo(data.data);
           setIsConnected(true);
@@ -127,10 +148,30 @@ function LiveMonitoringPage() {
           setAlerts(prev => [...prev, ...data.data]);
           addMessage('warning', `Alert received: ${data.data.length} new alerts`);
         } else if (data.type === 'analysis_update') {
+          console.log('[LiveMonitoring] Analysis update received:', {
+            procedure_source: data.data.procedure_source,
+            frame_count: data.data.frame_count,
+            all_steps_count: data.data.all_steps?.length,
+            first_step_sample: data.data.all_steps?.[0],
+            full_data: data.data
+          });
+          
           setCurrentAnalysis(data.data);
           setAnalysisHistory(prev => [...prev.slice(-9), data.data]);
+          
           // Update all steps with latest status
           if (data.data.all_steps) {
+            console.log('[LiveMonitoring] Setting all steps:', {
+              count: data.data.all_steps.length,
+              steps: data.data.all_steps.map((s, i) => ({
+                index: i,
+                phase_number: s.phase_number,
+                phase_name: s.phase_name,
+                step_name: s.step_name,
+                status: s.status,
+                has_checkpoints: s.checkpoints?.length > 0
+              }))
+            });
             setAllSteps(data.data.all_steps);
           }
           addMessage('info', `Analysis: Frame ${data.data.frame_count} - ${data.data.current_step_name}`);
@@ -147,7 +188,10 @@ function LiveMonitoringPage() {
         addMessage('info', 'WebSocket disconnected');
       });
 
-      await wsRef.current.connect(sessionId, selectedProcedure, surgeonId);
+      // Map analysisMode to procedure_source
+      const procedureSource = analysisMode === 'error-resolution' ? 'outlier' : 'standard';
+      
+      await wsRef.current.connect(sessionId, selectedProcedure, surgeonId, procedureSource, pipelineVersion);
       
     } catch (error) {
       addMessage('error', `Connection failed: ${error.message}`);
@@ -254,10 +298,86 @@ function LiveMonitoringPage() {
           <div className="bg-white rounded-lg shadow-md p-6">
             <h2 className="text-xl font-semibold mb-4">Session Control</h2>
             
+            {/* Pipeline Version Toggle */}
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Analysis Pipeline
+              </label>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setPipelineVersion('v1')}
+                  disabled={isConnected}
+                  className={`flex-1 py-2 px-3 rounded-md text-sm font-medium border transition-colors ${
+                    pipelineVersion === 'v1'
+                      ? 'bg-gray-700 text-white border-gray-700'
+                      : 'bg-white text-gray-600 border-gray-300 hover:border-gray-400'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  V1 (Legacy)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPipelineVersion('v2')}
+                  disabled={isConnected}
+                  className={`flex-1 py-2 px-3 rounded-md text-sm font-medium border transition-colors ${
+                    pipelineVersion === 'v2'
+                      ? 'bg-green-600 text-white border-green-600'
+                      : 'bg-white text-gray-600 border-gray-300 hover:border-gray-400'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  V2 (Gemini)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPipelineVersion('v3')}
+                  disabled={isConnected}
+                  className={`flex-1 py-2 px-3 rounded-md text-sm font-medium border transition-colors ${
+                    pipelineVersion === 'v3'
+                      ? 'bg-blue-600 text-white border-blue-600'
+                      : 'bg-white text-gray-600 border-gray-300 hover:border-gray-400'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  V3 (OpenAI)
+                </button>
+              </div>
+              <p className="mt-1 text-xs text-gray-500">
+                {pipelineVersion === 'v3'
+                  ? 'V3: OpenAI GPT-4.1-mini · Structured JSON · Vision API'
+                  : pipelineVersion === 'v2'
+                  ? 'V2: Gemini 2.5 Flash · No ffmpeg · Structured JSON'
+                  : 'V1: Legacy pipeline with ffmpeg + regex parsing'}
+              </p>
+            </div>
+
+            {/* Analysis Mode Selection */}
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Analysis Mode
+              </label>
+              <select
+                value={analysisMode}
+                onChange={(e) => {
+                  setAnalysisMode(e.target.value);
+                  setSelectedProcedure(''); // Reset procedure selection when mode changes
+                }}
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500"
+                disabled={isConnected}
+              >
+                <option value="standard">Standard Monitoring</option>
+                <option value="error-resolution">Error Resolution Protocol</option>
+              </select>
+              <p className="mt-1 text-xs text-gray-500">
+                {analysisMode === 'standard' 
+                  ? 'Track procedure steps and progress' 
+                  : 'Advanced error detection with safety checkpoints'}
+              </p>
+            </div>
+
             {/* Procedure Selection */}
             <div className="mb-4">
               <label className="block text-sm font-medium text-gray-700 mb-2">
-                Select Procedure
+                {analysisMode === 'standard' ? 'Select Procedure' : 'Select Protocol'}
               </label>
               <select
                 value={selectedProcedure}
@@ -265,13 +385,32 @@ function LiveMonitoringPage() {
                 className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500"
                 disabled={isConnected}
               >
-                <option value="">-- Select a procedure --</option>
-                {procedures.map((proc) => (
-                  <option key={proc.id} value={proc.id}>
-                    {proc.procedure_name}
-                  </option>
-                ))}
+                <option value="">
+                  {analysisMode === 'standard' 
+                    ? '-- Select a procedure --' 
+                    : '-- Select an error resolution protocol --'}
+                </option>
+                {analysisMode === 'standard' 
+                  ? procedures.map((proc) => (
+                      <option key={proc.id} value={proc.id}>
+                        {proc.procedure_name}
+                      </option>
+                    ))
+                  : outlierProcedures.map((proc) => (
+                      <option key={proc.id} value={proc.id}>
+                        {proc.procedure_name} (v{proc.version})
+                      </option>
+                    ))
+                }
               </select>
+              {analysisMode === 'error-resolution' && outlierProcedures.length === 0 && (
+                <p className="mt-2 text-sm text-amber-600">
+                  ⚠️ No error resolution protocols found. Please upload an outlier resolution document first using the API endpoint: 
+                  <code className="block mt-1 text-xs bg-gray-100 p-1 rounded">
+                    POST /api/outlier-procedures/upload
+                  </code>
+                </p>
+              )}
             </div>
 
             {/* Camera Selection */}
@@ -344,7 +483,7 @@ function LiveMonitoringPage() {
               <div className="flex items-center">
                 <div className={`w-3 h-3 rounded-full mr-2 ${isConnected ? 'bg-green-500' : 'bg-gray-400'}`} />
                 <span className="text-sm font-medium">
-                  {isConnected ? 'Connected' : 'Disconnected'}
+                  {isConnected ? `Connected (${pipelineVersion.toUpperCase()})` : 'Disconnected'}
                 </span>
               </div>
               {sessionInfo && (
@@ -438,79 +577,93 @@ function LiveMonitoringPage() {
             </div>
           </div>
 
-          {/* Procedure Steps Tracker */}
+          {/* Procedure Steps Tracker - Conditional Rendering */}
           {allSteps.length > 0 && (
             <div className="bg-white rounded-lg shadow-md p-6">
-              <h2 className="text-xl font-semibold mb-4">Procedure Steps Tracker</h2>
-              <div className="space-y-3">
-                {allSteps.map((step, index) => {
-                  const getStatusColor = (status) => {
-                    switch(status) {
-                      case 'completed': return 'bg-green-50 border-green-500';
-                      case 'current': return 'bg-blue-50 border-blue-500';
-                      case 'missed': return 'bg-red-50 border-red-500';
-                      default: return 'bg-gray-50 border-gray-300';
-                    }
-                  };
-                  
-                  const getStatusBadge = (status) => {
-                    switch(status) {
-                      case 'completed': return 'bg-green-100 text-green-800';
-                      case 'current': return 'bg-blue-100 text-blue-800';
-                      case 'missed': return 'bg-red-100 text-red-800';
-                      default: return 'bg-gray-100 text-gray-600';
-                    }
-                  };
-                  
-                  const getStatusIcon = (status) => {
-                    switch(status) {
-                      case 'completed': return '✓';
-                      case 'current': return '▶';
-                      case 'missed': return '✗';
-                      default: return '○';
-                    }
-                  };
-                  
-                  return (
-                    <div
-                      key={index}
-                      className={`p-4 rounded-lg border-l-4 ${getStatusColor(step.status)} transition-all duration-300`}
-                    >
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center flex-1">
-                          <span className={`inline-flex items-center justify-center w-8 h-8 rounded-full font-semibold mr-3 ${
-                            step.status === 'completed' ? 'bg-green-600 text-white' :
-                            step.status === 'current' ? 'bg-blue-600 text-white' :
-                            step.status === 'missed' ? 'bg-red-600 text-white' :
-                            'bg-gray-400 text-white'
-                          }`}>
-                            {step.step_number}
-                          </span>
-                          <div className="flex-1">
-                            <div className="flex items-center gap-2">
-                              <h3 className="font-semibold text-gray-900">{step.step_name}</h3>
-                              {step.is_critical && (
-                                <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">
-                                  Critical
-                                </span>
+              <h2 className="text-xl font-semibold mb-4">
+                {analysisMode === 'error-resolution' 
+                  ? 'Surgical Phases & Safety Checkpoints' 
+                  : 'Procedure Steps Tracker'}
+              </h2>
+              
+              {analysisMode === 'error-resolution' ? (
+                // Outlier mode: Show phases with checkpoints
+                <OutlierPhaseTracker 
+                  phases={allSteps} 
+                  currentPhaseIndex={currentAnalysis?.current_step_index || 0}
+                />
+              ) : (
+                // Standard mode: Show traditional step tracker
+                <div className="space-y-3">
+                  {allSteps.map((step, index) => {
+                    const getStatusColor = (status) => {
+                      switch(status) {
+                        case 'completed': return 'bg-green-50 border-green-500';
+                        case 'current': return 'bg-blue-50 border-blue-500';
+                        case 'missed': return 'bg-red-50 border-red-500';
+                        default: return 'bg-gray-50 border-gray-300';
+                      }
+                    };
+                    
+                    const getStatusBadge = (status) => {
+                      switch(status) {
+                        case 'completed': return 'bg-green-100 text-green-800';
+                        case 'current': return 'bg-blue-100 text-blue-800';
+                        case 'missed': return 'bg-red-100 text-red-800';
+                        default: return 'bg-gray-100 text-gray-600';
+                      }
+                    };
+                    
+                    const getStatusIcon = (status) => {
+                      switch(status) {
+                        case 'completed': return '✓';
+                        case 'current': return '▶';
+                        case 'missed': return '✗';
+                        default: return '○';
+                      }
+                    };
+                    
+                    return (
+                      <div
+                        key={index}
+                        className={`p-4 rounded-lg border-l-4 ${getStatusColor(step.status)} transition-all duration-300`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center flex-1">
+                            <span className={`inline-flex items-center justify-center w-8 h-8 rounded-full font-semibold mr-3 ${
+                              step.status === 'completed' ? 'bg-green-600 text-white' :
+                              step.status === 'current' ? 'bg-blue-600 text-white' :
+                              step.status === 'missed' ? 'bg-red-600 text-white' :
+                              'bg-gray-400 text-white'
+                            }`}>
+                              {step.step_number}
+                            </span>
+                            <div className="flex-1">
+                              <div className="flex items-center gap-2">
+                                <h3 className="font-semibold text-gray-900">{step.step_name}</h3>
+                                {step.is_critical && (
+                                  <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">
+                                    Critical
+                                  </span>
+                                )}
+                              </div>
+                              {step.description && (
+                                <p className="text-sm text-gray-600 mt-1">{step.description}</p>
                               )}
                             </div>
-                            {step.description && (
-                              <p className="text-sm text-gray-600 mt-1">{step.description}</p>
-                            )}
+                          </div>
+                          <div className="ml-4">
+                            <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-medium ${getStatusBadge(step.status)}`}>
+                              <span className="mr-1">{getStatusIcon(step.status)}</span>
+                              {step.status.charAt(0).toUpperCase() + step.status.slice(1)}
+                            </span>
                           </div>
                         </div>
-                        <div className="ml-4">
-                          <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-medium ${getStatusBadge(step.status)}`}>
-                            <span className="mr-1">{getStatusIcon(step.status)}</span>
-                            {step.status.charAt(0).toUpperCase() + step.status.slice(1)}
-                          </span>
-                        </div>
                       </div>
-                    </div>
-                  );
-                })}
-              </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 
