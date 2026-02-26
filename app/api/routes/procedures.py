@@ -17,6 +17,7 @@ from app.schemas.procedure import (
 )
 from app.services.video_analysis import VideoAnalysisService
 from app.services.recorded_video_comparison import RecordedVideoComparisonService
+from app.services.chunked_video_comparison import ChunkedVideoComparisonService
 from app.services.video_upload import VideoUploadService
 
 router = APIRouter()
@@ -194,3 +195,77 @@ async def compare_recorded_video(
     except Exception as e:
         # Handle unexpected errors
         raise HTTPException(status_code=500, detail=f"Comparison failed: {str(e)}")
+
+
+@router.post("/compare-chunked")
+async def compare_recorded_video_chunked(
+    request: dict,
+    db: AsyncDatabase = Depends(get_db)
+):
+    """
+    Compare a long recorded video against a procedure using chunked analysis.
+
+    For videos longer than ~25 minutes, the video is automatically split into
+    20-minute chunks with 60-second overlap. Each chunk receives the full
+    analysis of all previous chunks as rolling history context.
+
+    For short videos (<= 25 min), this transparently delegates to the
+    original /compare endpoint logic.
+
+    Request body:
+        {
+            "video_gs_uri": "gs://bucket/video.mp4",
+            "procedure_id": "507f1f77bcf86cd799439011",
+            "procedure_source": "standard",  // or "outlier"
+            "video_duration_sec": 4200        // required — total video duration in seconds
+        }
+
+    Returns:
+        Complete comparison results with detected steps, checkpoints, errors,
+        plus chunking_metadata showing how the video was split.
+    """
+    video_gs_uri = request.get("video_gs_uri")
+    procedure_id = request.get("procedure_id")
+    procedure_source = request.get("procedure_source", "standard")
+    video_duration_sec = request.get("video_duration_sec")
+
+    if not video_gs_uri:
+        raise HTTPException(status_code=400, detail="video_gs_uri is required")
+
+    if not procedure_id:
+        raise HTTPException(status_code=400, detail="procedure_id is required")
+
+    if not ObjectId.is_valid(procedure_id):
+        raise HTTPException(status_code=400, detail="Invalid procedure ID")
+
+    if procedure_source not in ["standard", "outlier"]:
+        raise HTTPException(
+            status_code=400,
+            detail="procedure_source must be 'standard' or 'outlier'"
+        )
+
+    if video_duration_sec is not None:
+        try:
+            video_duration_sec = float(video_duration_sec)
+            if video_duration_sec <= 0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="video_duration_sec must be a positive number (seconds)"
+            )
+
+    try:
+        service = ChunkedVideoComparisonService(db)
+        result = await service.compare_video(
+            video_gs_uri=video_gs_uri,
+            procedure_id=procedure_id,
+            procedure_source=procedure_source,
+            video_duration_sec=video_duration_sec,
+        )
+
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=429 if "rate limit" in str(e).lower() else 400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Chunked comparison failed: {str(e)}")

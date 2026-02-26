@@ -6,6 +6,7 @@ function RecordedVideoComparisonPage() {
   const [inputMode, setInputMode] = useState('url'); // 'url' or 'upload'
   const [videoUrl, setVideoUrl] = useState('');
   const [selectedFile, setSelectedFile] = useState(null);
+  const [videoDuration, setVideoDuration] = useState(null); // Duration in seconds
   const [procedureId, setProcedureId] = useState('');
   const [procedureSource, setProcedureSource] = useState('standard');
   const [procedures, setProcedures] = useState([]);
@@ -59,6 +60,15 @@ function RecordedVideoComparisonPage() {
       
       setSelectedFile(file);
       setError(null);
+      
+      // Extract video duration
+      const video = document.createElement('video');
+      video.preload = 'metadata';
+      video.onloadedmetadata = () => {
+        window.URL.revokeObjectURL(video.src);
+        setVideoDuration(Math.floor(video.duration));
+      };
+      video.src = URL.createObjectURL(file);
     }
   };
 
@@ -127,14 +137,21 @@ function RecordedVideoComparisonPage() {
       setIsAnalyzing(true);
       setCurrentStep('Analyzing video against procedure...');
 
-      const response = await fetch('/api/procedures/compare', {
+      const requestBody = {
+        video_gs_uri: finalVideoUrl,
+        procedure_id: procedureId,
+        procedure_source: procedureSource
+      };
+
+      // Add video duration if available (enables automatic chunking for long videos)
+      if (videoDuration) {
+        requestBody.video_duration_sec = videoDuration;
+      }
+
+      const response = await fetch('/api/procedures/compare-chunked', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          video_gs_uri: finalVideoUrl,
-          procedure_id: procedureId,
-          procedure_source: procedureSource
-        })
+        body: JSON.stringify(requestBody)
       });
 
       if (!response.ok) {
@@ -279,37 +296,43 @@ function RecordedVideoComparisonPage() {
             <label className="block text-sm font-medium text-gray-700 mb-2">
               Upload Video File <span className="text-red-500">*</span>
             </label>
-            <div className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-blue-500 transition-colors">
-              <input
-                type="file"
-                accept="video/mp4,video/avi,video/mov,video/quicktime"
-                onChange={handleFileSelect}
-                className="hidden"
-                id="video-upload"
-                disabled={isAnalyzing || isUploading}
-              />
-              <label
-                htmlFor="video-upload"
-                className="cursor-pointer flex flex-col items-center"
-              >
-                <Upload className="h-12 w-12 text-gray-400 mb-2" />
-                {selectedFile ? (
-                  <div>
-                    <p className="text-sm font-medium text-gray-900">{selectedFile.name}</p>
-                    <p className="text-sm text-gray-500">
-                      {(selectedFile.size / 1024 / 1024).toFixed(2)} MB
-                    </p>
-                  </div>
-                ) : (
-                  <div>
-                    <p className="text-sm font-medium text-gray-900">
-                      Click to upload or drag and drop
-                    </p>
-                    <p className="text-sm text-gray-500">MP4, AVI, or MOV (max 500MB)</p>
-                  </div>
-                )}
+            <div className="flex items-center gap-4">
+              <label className="flex-1 cursor-pointer">
+                <div className={`border-2 border-dashed rounded-lg p-6 text-center transition-colors ${
+                  selectedFile 
+                    ? 'border-green-500 bg-green-50' 
+                    : 'border-gray-300 hover:border-blue-500 hover:bg-blue-50'
+                }`}>
+                  <Upload className="mx-auto mb-2 text-gray-400" size={32} />
+                  <p className="text-sm text-gray-600">
+                    {selectedFile ? selectedFile.name : 'Click to select video file'}
+                  </p>
+                  {selectedFile && (
+                    <div className="text-xs text-gray-500 mt-1 space-y-1">
+                      <p>{(selectedFile.size / 1024 / 1024).toFixed(2)} MB</p>
+                      {videoDuration && (
+                        <p className="font-medium">
+                          Duration: {Math.floor(videoDuration / 60)}:{String(videoDuration % 60).padStart(2, '0')}
+                          {videoDuration > 1500 && (
+                            <span className="ml-2 text-blue-600">• Chunking enabled</span>
+                          )}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+                <input
+                  type="file"
+                  accept="video/mp4,video/avi,video/mov,video/quicktime"
+                  onChange={handleFileSelect}
+                  className="hidden"
+                  disabled={isAnalyzing || isUploading}
+                />
               </label>
             </div>
+            <p className="text-xs text-gray-500 mt-2">
+              Supported formats: MP4, AVI, MOV (max 500MB). Videos &gt;25 min are automatically chunked.
+            </p>
           </div>
         )}
 
@@ -509,24 +532,44 @@ function RecordedVideoComparisonPage() {
                           </div>
                           
                           {item.checkpoints_met && item.checkpoints_met.length > 0 && (
-                            <div className="bg-green-50 rounded p-2">
-                              <p className="text-sm font-medium text-green-800 mb-1">✓ Met:</p>
-                              <ul className="text-sm text-green-700 space-y-1">
+                            <div className="bg-green-50 rounded p-3 border border-green-200">
+                              <p className="text-sm font-medium text-green-800 mb-2">Checkpoints Met:</p>
+                              <div className="space-y-2">
                                 {item.checkpoints_met.map((cp, idx) => (
-                                  <li key={idx}>• {cp.name}</li>
+                                  <div key={idx} className="flex items-start gap-2">
+                                    <CheckCircle className="text-green-600 flex-shrink-0 mt-0.5" size={16} />
+                                    <div className="flex-1">
+                                      <p className="text-sm font-medium text-green-900">{cp.name}</p>
+                                      {cp.evidence && (
+                                        <p className="text-xs text-green-700 mt-1">
+                                          Evidence: {cp.evidence}
+                                        </p>
+                                      )}
+                                    </div>
+                                  </div>
                                 ))}
-                              </ul>
+                              </div>
                             </div>
                           )}
                           
                           {item.checkpoints_not_met && item.checkpoints_not_met.length > 0 && (
-                            <div className="bg-red-50 rounded p-2">
-                              <p className="text-sm font-medium text-red-800 mb-1">✗ Not Met:</p>
-                              <ul className="text-sm text-red-700 space-y-1">
+                            <div className="bg-red-50 rounded p-3 border border-red-200">
+                              <p className="text-sm font-medium text-red-800 mb-2">Checkpoints Not Met:</p>
+                              <div className="space-y-2">
                                 {item.checkpoints_not_met.map((cp, idx) => (
-                                  <li key={idx}>• {cp.name}</li>
+                                  <div key={idx} className="flex items-start gap-2">
+                                    <XCircle className="text-red-600 flex-shrink-0 mt-0.5" size={16} />
+                                    <div className="flex-1">
+                                      <p className="text-sm font-medium text-red-900">{cp.name}</p>
+                                      {cp.evidence && (
+                                        <p className="text-xs text-red-700 mt-1">
+                                          Evidence: {cp.evidence}
+                                        </p>
+                                      )}
+                                    </div>
+                                  </div>
                                 ))}
-                              </ul>
+                              </div>
                             </div>
                           )}
                         </div>

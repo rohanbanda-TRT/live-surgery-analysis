@@ -425,18 +425,20 @@ After analyzing all phases, provide:
                     evidence = evidence_match.group(1).strip()[:200]
                 
                 # Extract checkpoint validation
-                checkpoint_section_pattern = rf"Phase {re.escape(phase_number)}:.*?CHECKPOINT VALIDATION:(.*?)(?=ERROR CODES|PHASE COMPLETION|Phase \d|$)"
+                checkpoint_section_pattern = rf"Phase {re.escape(phase_number)}:.*?CHECKPOINT VALIDATION:(.*?)(?=\*\*ERROR CODES|\*\*PHASE COMPLETION|Phase \d|$)"
                 checkpoint_section_match = re.search(checkpoint_section_pattern, analysis, re.IGNORECASE | re.DOTALL)
                 
                 if checkpoint_section_match:
                     checkpoint_text = checkpoint_section_match.group(1)
                     
-                    # Parse individual checkpoints
-                    checkpoint_pattern = r"-\s*(.+?):\s*(MET|NOT MET)\s*-\s*(.+?)(?=\n-|\n\*\*|$)"
-                    for cp_match in re.finditer(checkpoint_pattern, checkpoint_text, re.DOTALL):
+                    # Parse individual checkpoints - more flexible pattern
+                    # Matches: "- [name]: MET - [evidence]" or "- [name]: NOT MET - [evidence]"
+                    # Evidence is optional
+                    checkpoint_pattern = r"-\s*(.+?):\s*(MET|NOT\s+MET)(?:\s*-\s*(.+?))?(?=\n-|\n\*\*|\Z)"
+                    for cp_match in re.finditer(checkpoint_pattern, checkpoint_text, re.DOTALL | re.IGNORECASE):
                         cp_name = cp_match.group(1).strip()
-                        cp_status = cp_match.group(2).strip()
-                        cp_evidence = cp_match.group(3).strip()
+                        cp_status = cp_match.group(2).strip().upper().replace(" ", "_")
+                        cp_evidence = cp_match.group(3).strip() if cp_match.group(3) else ""
                         
                         if cp_status == "MET":
                             checkpoints_met.append({

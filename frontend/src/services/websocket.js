@@ -22,13 +22,17 @@ class LiveSurgeryWebSocket {
    * @param {string} surgeonId - ID of the surgeon
    * @param {string} procedureSource - 'standard' or 'outlier'
    */
-  connect(sessionId, procedureId, surgeonId = 'default-surgeon', procedureSource = 'standard') {
+  connect(sessionId, procedureId, surgeonId = 'default-surgeon', procedureSource = 'standard', pipelineVersion = 'v1') {
     return new Promise((resolve, reject) => {
       this.sessionId = sessionId;
       this.procedureSource = procedureSource;
-      const wsUrl = `${WS_BASE_URL}/api/sessions/ws/${sessionId}`;
+      this.pipelineVersion = pipelineVersion;
+      const sessionPath = pipelineVersion === 'v3' ? 'sessions-v3'
+        : (pipelineVersion === 'v2') ? 'sessions-v2'
+        : 'sessions';
+      const wsUrl = `${WS_BASE_URL}/api/${sessionPath}/ws/${sessionId}`;
 
-      console.log(`Connecting to WebSocket: ${wsUrl}`);
+      console.log(`Connecting to WebSocket: ${wsUrl} (pipeline: ${pipelineVersion})`);
 
       try {
         this.ws = new WebSocket(wsUrl);
@@ -84,7 +88,7 @@ class LiveSurgeryWebSocket {
             this.reconnectAttempts++;
             console.log(`Reconnecting... Attempt ${this.reconnectAttempts}`);
             setTimeout(() => {
-              this.connect(sessionId, procedureId, surgeonId, this.procedureSource);
+              this.connect(sessionId, procedureId, surgeonId, this.procedureSource, this.pipelineVersion);
             }, 2000 * this.reconnectAttempts);
           }
         };

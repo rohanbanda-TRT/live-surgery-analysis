@@ -21,6 +21,7 @@ function LiveMonitoringPage() {
   const [allSteps, setAllSteps] = useState([]);
   const [availableCameras, setAvailableCameras] = useState([]);
   const [selectedCameraId, setSelectedCameraId] = useState('');
+  const [pipelineVersion, setPipelineVersion] = useState('v2');
   
   const wsRef = useRef(null);
   const videoRef = useRef(null);
@@ -190,7 +191,7 @@ function LiveMonitoringPage() {
       // Map analysisMode to procedure_source
       const procedureSource = analysisMode === 'error-resolution' ? 'outlier' : 'standard';
       
-      await wsRef.current.connect(sessionId, selectedProcedure, surgeonId, procedureSource);
+      await wsRef.current.connect(sessionId, selectedProcedure, surgeonId, procedureSource, pipelineVersion);
       
     } catch (error) {
       addMessage('error', `Connection failed: ${error.message}`);
@@ -297,6 +298,58 @@ function LiveMonitoringPage() {
           <div className="bg-white rounded-lg shadow-md p-6">
             <h2 className="text-xl font-semibold mb-4">Session Control</h2>
             
+            {/* Pipeline Version Toggle */}
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Analysis Pipeline
+              </label>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setPipelineVersion('v1')}
+                  disabled={isConnected}
+                  className={`flex-1 py-2 px-3 rounded-md text-sm font-medium border transition-colors ${
+                    pipelineVersion === 'v1'
+                      ? 'bg-gray-700 text-white border-gray-700'
+                      : 'bg-white text-gray-600 border-gray-300 hover:border-gray-400'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  V1 (Legacy)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPipelineVersion('v2')}
+                  disabled={isConnected}
+                  className={`flex-1 py-2 px-3 rounded-md text-sm font-medium border transition-colors ${
+                    pipelineVersion === 'v2'
+                      ? 'bg-green-600 text-white border-green-600'
+                      : 'bg-white text-gray-600 border-gray-300 hover:border-gray-400'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  V2 (Gemini)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPipelineVersion('v3')}
+                  disabled={isConnected}
+                  className={`flex-1 py-2 px-3 rounded-md text-sm font-medium border transition-colors ${
+                    pipelineVersion === 'v3'
+                      ? 'bg-blue-600 text-white border-blue-600'
+                      : 'bg-white text-gray-600 border-gray-300 hover:border-gray-400'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  V3 (OpenAI)
+                </button>
+              </div>
+              <p className="mt-1 text-xs text-gray-500">
+                {pipelineVersion === 'v3'
+                  ? 'V3: OpenAI GPT-4.1-mini · Structured JSON · Vision API'
+                  : pipelineVersion === 'v2'
+                  ? 'V2: Gemini 2.5 Flash · No ffmpeg · Structured JSON'
+                  : 'V1: Legacy pipeline with ffmpeg + regex parsing'}
+              </p>
+            </div>
+
             {/* Analysis Mode Selection */}
             <div className="mb-4">
               <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -430,7 +483,7 @@ function LiveMonitoringPage() {
               <div className="flex items-center">
                 <div className={`w-3 h-3 rounded-full mr-2 ${isConnected ? 'bg-green-500' : 'bg-gray-400'}`} />
                 <span className="text-sm font-medium">
-                  {isConnected ? 'Connected' : 'Disconnected'}
+                  {isConnected ? `Connected (${pipelineVersion.toUpperCase()})` : 'Disconnected'}
                 </span>
               </div>
               {sessionInfo && (
