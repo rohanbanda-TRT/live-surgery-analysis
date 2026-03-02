@@ -281,11 +281,16 @@ Evidence: [specific visual evidence from video]
 Timestamp: [approximate time range when this phase occurred]
 
 **CHECKPOINT VALIDATION:**
-For each checkpoint in this phase:
-- [Checkpoint name]: [MET/NOT MET] - [Evidence]
+IMPORTANT: Only validate the specific checkpoint requirements listed for this phase. Do NOT include prevention strategies or general observations here.
+For each checkpoint requirement listed in the phase definition:
+- [Checkpoint requirement]: [MET/NOT MET] - [Evidence]
+
+Example format:
+- Correct imaging available and verified: MET - X-ray and MRI shown
+- Level/laterality confirmed with fluoroscopy: NOT MET - No fluoroscopy shown
 
 **ERROR CODES DETECTED:**
-- [List any error codes observed, e.g., "A8 - Coagulation omitted before tissue manipulation"]
+- [List any error codes observed, e.g., "A8 (Action Errors): Coagulation omitted before tissue manipulation"]
 
 **PHASE COMPLETION:**
 - Status: [COMPLETED/PARTIAL/NOT_PERFORMED]
@@ -424,38 +429,51 @@ After analyzing all phases, provide:
                 if evidence_match:
                     evidence = evidence_match.group(1).strip()[:200]
                 
-                # Extract checkpoint validation
-                checkpoint_section_pattern = rf"Phase {re.escape(phase_number)}:.*?CHECKPOINT VALIDATION:(.*?)(?=\*\*ERROR CODES|\*\*PHASE COMPLETION|Phase \d|$)"
-                checkpoint_section_match = re.search(checkpoint_section_pattern, analysis, re.IGNORECASE | re.DOTALL)
+                # Extract checkpoint validation - only within this specific phase
+                # First, extract the entire phase section to avoid cross-phase contamination
+                phase_section_pattern = rf"(Phase {re.escape(phase_number)}:.*?)(?=\n---|\nPhase \d+\.\d+:|\Z)"
+                phase_section_match = re.search(phase_section_pattern, analysis, re.IGNORECASE | re.DOTALL)
                 
-                if checkpoint_section_match:
-                    checkpoint_text = checkpoint_section_match.group(1)
+                if phase_section_match:
+                    phase_section = phase_section_match.group(1)
                     
-                    # Parse individual checkpoints - more flexible pattern
-                    # Matches: "- [name]: MET - [evidence]" or "- [name]: NOT MET - [evidence]"
-                    # Evidence is optional
-                    checkpoint_pattern = r"-\s*(.+?):\s*(MET|NOT\s+MET)(?:\s*-\s*(.+?))?(?=\n-|\n\*\*|\Z)"
-                    for cp_match in re.finditer(checkpoint_pattern, checkpoint_text, re.DOTALL | re.IGNORECASE):
-                        cp_name = cp_match.group(1).strip()
-                        cp_status = cp_match.group(2).strip().upper().replace(" ", "_")
-                        cp_evidence = cp_match.group(3).strip() if cp_match.group(3) else ""
+                    # Now extract checkpoint validation within this phase section only
+                    checkpoint_section_pattern = r"CHECKPOINT VALIDATION:(.*?)(?=\*\*ERROR CODES|\*\*PHASE COMPLETION|\Z)"
+                    checkpoint_section_match = re.search(checkpoint_section_pattern, phase_section, re.IGNORECASE | re.DOTALL)
+                    
+                    if checkpoint_section_match:
+                        checkpoint_text = checkpoint_section_match.group(1)
                         
-                        if cp_status == "MET":
-                            checkpoints_met.append({
-                                "name": cp_name,
-                                "evidence": cp_evidence
-                            })
-                        else:
-                            checkpoints_not_met.append({
-                                "name": cp_name,
-                                "evidence": cp_evidence
-                            })
+                        # Parse individual checkpoints - more flexible pattern
+                        # Matches: "- [name]: MET - [evidence]" or "- [name]: NOT MET - [evidence]"
+                        # Evidence is optional
+                        checkpoint_pattern = r"-\s*(.+?):\s*(MET|NOT\s+MET)(?:\s*-\s*(.+?))?(?=\n-|\n\*\*|\Z)"
+                        for cp_match in re.finditer(checkpoint_pattern, checkpoint_text, re.DOTALL | re.IGNORECASE):
+                            cp_name = cp_match.group(1).strip()
+                            cp_status = cp_match.group(2).strip().upper().replace(" ", "_")
+                            cp_evidence = cp_match.group(3).strip() if cp_match.group(3) else ""
+                            
+                            if cp_status == "MET":
+                                checkpoints_met.append({
+                                    "name": cp_name,
+                                    "evidence": cp_evidence
+                                })
+                            else:
+                                checkpoints_not_met.append({
+                                    "name": cp_name,
+                                    "evidence": cp_evidence
+                                })
                 
                 # Extract completion status
                 completion_pattern = rf"Phase {re.escape(phase_number)}:.*?Status:\s*(COMPLETED|PARTIAL|NOT_PERFORMED)"
                 completion_match = re.search(completion_pattern, analysis, re.IGNORECASE | re.DOTALL)
                 if completion_match:
                     completion = completion_match.group(1).upper()
+            
+            # Count total checkpoint requirements (not just checkpoint objects)
+            total_checkpoint_requirements = 0
+            for checkpoint in step.get("checkpoints", []):
+                total_checkpoint_requirements += len(checkpoint.get("requirements", []))
             
             detected_phases.append({
                 "phase_number": phase_number,
@@ -467,15 +485,22 @@ After analyzing all phases, provide:
                 "evidence": evidence,
                 "checkpoints_met": checkpoints_met,
                 "checkpoints_not_met": checkpoints_not_met,
-                "total_checkpoints": len(step.get("checkpoints", [])),
+                "total_checkpoints": total_checkpoint_requirements,
                 "checkpoints_satisfied": len(checkpoints_met)
             })
         
         # Extract error codes
-        error_pattern = r"(A\d+|C\d+|R\d+)\s*-\s*(.+?)(?=\n|$)"
-        for error_match in re.finditer(error_pattern, analysis):
+        # Handles formats like:
+        # - "C1 - description" 
+        # - "C1 (Checking Errors): description"
+        # - "- C1 (Checking Errors): description"
+        # Each error should be on its own line
+        error_pattern = r"^-?\s*(A\d+|C\d+|R\d+)\s*(?:\([^)]+\))?\s*[:-]\s*(.+?)$"
+        for error_match in re.finditer(error_pattern, analysis, re.MULTILINE):
             error_code = error_match.group(1)
             error_description = error_match.group(2).strip()
+            # Clean up the description (remove extra whitespace and trailing periods)
+            error_description = ' '.join(error_description.split()).rstrip('.')
             all_errors.append({
                 "code": error_code,
                 "description": error_description
