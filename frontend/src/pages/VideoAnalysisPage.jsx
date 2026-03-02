@@ -6,6 +6,8 @@ import '../styles/common/buttons.css';
 import '../styles/common/cards.css';
 import '../styles/common/forms.css';
 
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'https://surgery-analysis-api.demotrt.com';
+
 function VideoAnalysisPage() {
   const [inputMode, setInputMode] = useState('url'); // 'url' or 'upload'
   const [videoUri, setVideoUri] = useState('');
@@ -55,7 +57,7 @@ function VideoAnalysisPage() {
       const formData = new FormData();
       formData.append('file', selectedFile);
 
-      const response = await fetch('/api/procedures/upload-video', {
+      const response = await fetch(`${API_BASE_URL}/api/procedures/upload-video`, {
         method: 'POST',
         body: formData
       });

@@ -522,13 +522,13 @@ function RecordedVideoComparisonPage() {
                       )}
 
                       {/* Checkpoints for Outlier Mode */}
-                      {procedureSource === 'outlier' && item.detected && (
+                      {procedureSource === 'outlier' && item.total_checkpoints > 0 && (
                         <div className="mt-3 space-y-2">
                           <div className="flex items-center gap-2 text-sm font-medium">
                             <span className="text-gray-700">
                               Checkpoints: {item.checkpoints_satisfied}/{item.total_checkpoints}
                             </span>
-                            {item.checkpoints_satisfied === item.total_checkpoints && (
+                            {item.detected && item.checkpoints_satisfied === item.total_checkpoints && (
                               <CheckCircle className="text-green-600" size={16} />
                             )}
                           </div>
