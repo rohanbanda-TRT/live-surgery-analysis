@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     VERTEX_AI_LOCATION: str = "us-central1"
     
     # Gemini API
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-2.5-pro"
     GEMINI_TEMPERATURE: float = 0.1
     GEMINI_MAX_OUTPUT_TOKENS: int = 880192
 

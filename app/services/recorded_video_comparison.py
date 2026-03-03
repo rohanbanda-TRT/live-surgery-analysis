@@ -14,6 +14,7 @@ from app.db.collections import MASTER_PROCEDURES, OUTLIER_PROCEDURES
 from app.prompts.outlier_prompts import build_outlier_resolution_context
 from app.prompts.standard_prompts import get_video_analysis_prompt
 from app.services.outlier_analysis import OutlierAnalysisParser, CheckpointTracker
+from app.services.procedure_cache import ProcedureCache
 from app.core.logging import logger
 
 
@@ -28,21 +29,24 @@ class RecordedVideoComparisonService:
     - Overall comparison results
     """
     
-    def __init__(self, db: AsyncDatabase):
+    def __init__(self, db: AsyncDatabase, procedure_cache: Optional[ProcedureCache] = None):
         """
         Initialize recorded video comparison service.
         
         Args:
             db: MongoDB database instance
+            procedure_cache: Optional procedure cache to avoid repeated DB queries
         """
         self.db = db
         self.gemini_client = GeminiClient()
+        self.procedure_cache = procedure_cache or ProcedureCache()
     
     async def compare_video(
         self,
         video_gs_uri: str,
         procedure_id: str,
-        procedure_source: str = "standard"
+        procedure_source: str = "standard",
+        cached_procedure: Optional[tuple] = None
     ) -> Dict[str, Any]:
         """
         Compare a recorded video against a procedure.
@@ -51,6 +55,7 @@ class RecordedVideoComparisonService:
             video_gs_uri: Google Cloud Storage URI of the recorded video
             procedure_id: ID of the master or outlier procedure to compare against
             procedure_source: "standard" for master procedures, "outlier" for outlier procedures
+            cached_procedure: Optional pre-loaded (procedure, procedure_steps) tuple to avoid DB access
             
         Returns:
             Complete comparison results with detected steps, checkpoints, and errors
@@ -63,8 +68,18 @@ class RecordedVideoComparisonService:
                 procedure_source=procedure_source
             )
             
-            # Load procedure
-            procedure, procedure_steps = await self._load_procedure(procedure_id, procedure_source)
+            # Load procedure (from cache or parameter if provided)
+            if cached_procedure:
+                procedure, procedure_steps = cached_procedure
+                logger.info(
+                    "using_cached_procedure_data",
+                    procedure_id=procedure_id,
+                    procedure_source=procedure_source
+                )
+            else:
+                procedure, procedure_steps = await self.procedure_cache.load_procedure(
+                    self.db, procedure_id, procedure_source
+                )
             
             # Build prompt based on procedure source
             if procedure_source == "outlier":
@@ -141,51 +156,10 @@ class RecordedVideoComparisonService:
             raise
     
     async def _load_procedure(self, procedure_id: str, procedure_source: str):
-        """Load procedure from database."""
-        if procedure_source == "outlier":
-            procedure = await self.db[OUTLIER_PROCEDURES].find_one(
-                {"_id": ObjectId(procedure_id)}
-            )
-            
-            if not procedure:
-                raise ValueError(f"Outlier procedure {procedure_id} not found")
-            
-            # Build procedure steps from phases
-            procedure_steps = []
-            for phase in procedure.get("phases", []):
-                procedure_steps.append({
-                    "step_number": phase.get("phase_number"),
-                    "step_name": phase.get("phase_name"),
-                    "description": phase.get("goal"),
-                    "phase_number": phase.get("phase_number"),
-                    "priority": phase.get("priority"),
-                    "checkpoints": phase.get("checkpoints", []),
-                    "critical_errors": phase.get("critical_errors", [])
-                })
-            
-            logger.info(
-                "outlier_procedure_loaded",
-                procedure_name=procedure.get("procedure_name"),
-                phases_count=len(procedure_steps)
-            )
-            
-        else:
-            procedure = await self.db[MASTER_PROCEDURES].find_one(
-                {"_id": ObjectId(procedure_id)}
-            )
-            
-            if not procedure:
-                raise ValueError(f"Master procedure {procedure_id} not found")
-            
-            procedure_steps = procedure.get("steps", [])
-            
-            logger.info(
-                "master_procedure_loaded",
-                procedure_name=procedure.get("procedure_name"),
-                steps_count=len(procedure_steps)
-            )
-        
-        return procedure, procedure_steps
+        """Load procedure from cache or database."""
+        return await self.procedure_cache.load_procedure(
+            self.db, procedure_id, procedure_source
+        )
     
     def _build_standard_comparison_prompt(
         self, 
@@ -290,7 +264,13 @@ Example format:
 - Level/laterality confirmed with fluoroscopy: NOT MET - No fluoroscopy shown
 
 **ERROR CODES DETECTED:**
-- [List any error codes observed, e.g., "A8 (Action Errors): Coagulation omitted before tissue manipulation"]
+IMPORTANT: Error codes can occur multiple times at different points during surgery. List each occurrence separately with timestamp and specific details.
+Format for each error occurrence:
+- [Code] ([Category]) at [timestamp]: [What exactly happened] - [Specific visual evidence]
+
+Example:
+- A8 (Action Errors) at 05:23: Coagulation omitted before tissue manipulation - Surgeon proceeded to manipulate tissue without performing bipolar coagulation on visible vessels
+- C1 (Checking Errors) at 12:45: Fluoroscopy confirmation skipped - No fluoroscopy verification shown before advancing to next phase
 
 **PHASE COMPLETION:**
 - Status: [COMPLETED/PARTIAL/NOT_PERFORMED]
@@ -411,100 +391,170 @@ After analyzing all phases, provide:
             phase_name = step["step_name"]
             
             # Look for this phase in the analysis
-            pattern = rf"Phase {re.escape(phase_number)}:.*?Detected:\s*(YES|NO)"
+            # Handle markdown bold: **Phase 3.1:** and bullet points: *   **Detected:** YES
+            pattern = rf"\*{{0,2}}Phase {re.escape(phase_number)}:\*{{0,2}}.*?\*{{0,2}}Detected:\*{{0,2}}\s*(YES|NO)"
             match = re.search(pattern, analysis, re.IGNORECASE | re.DOTALL)
             
             detected = False
             evidence = ""
             completion = "NOT_PERFORMED"
-            checkpoints_met = []
-            checkpoints_not_met = []
+            checkpoint_groups = []  # Changed to grouped structure
+            
+            # Get checkpoint definitions from procedure
+            phase_checkpoints = step.get("checkpoints", [])
             
             if match:
                 detected = match.group(1).upper() == "YES"
                 
                 # Extract evidence
-                evidence_pattern = rf"Phase {re.escape(phase_number)}:.*?Evidence:\s*(.+?)(?=Timestamp:|CHECKPOINT|$)"
+                evidence_pattern = rf"\*{{0,2}}Phase {re.escape(phase_number)}:\*{{0,2}}.*?\*{{0,2}}Evidence:\*{{0,2}}\s*(.+?)(?=\*{{0,2}}Timestamp:|\*{{0,2}}CHECKPOINT|$)"
                 evidence_match = re.search(evidence_pattern, analysis, re.IGNORECASE | re.DOTALL)
                 if evidence_match:
                     evidence = evidence_match.group(1).strip()[:200]
                 
                 # Extract checkpoint validation - only within this specific phase
                 # First, extract the entire phase section to avoid cross-phase contamination
-                phase_section_pattern = rf"(Phase {re.escape(phase_number)}:.*?)(?=\n---|\nPhase \d+\.\d+:|\Z)"
+                phase_section_pattern = rf"(\*{{0,2}}Phase {re.escape(phase_number)}:\*{{0,2}}.*?)(?=\n---\s*\n|\n\*{{0,2}}Phase \d+\.\d+:\*{{0,2}}|\Z)"
                 phase_section_match = re.search(phase_section_pattern, analysis, re.IGNORECASE | re.DOTALL)
                 
+                # Build validation results map
+                validation_results = {}
                 if phase_section_match:
                     phase_section = phase_section_match.group(1)
                     
                     # Now extract checkpoint validation within this phase section only
-                    checkpoint_section_pattern = r"CHECKPOINT VALIDATION:(.*?)(?=\*\*ERROR CODES|\*\*PHASE COMPLETION|\Z)"
+                    checkpoint_section_pattern = r"\*{0,2}CHECKPOINT VALIDATION:\*{0,2}(.*?)(?=\*{0,2}ERROR CODES|\*{0,2}PHASE COMPLETION|\Z)"
                     checkpoint_section_match = re.search(checkpoint_section_pattern, phase_section, re.IGNORECASE | re.DOTALL)
                     
                     if checkpoint_section_match:
                         checkpoint_text = checkpoint_section_match.group(1)
                         
-                        # Parse individual checkpoints - more flexible pattern
-                        # Matches: "- [name]: MET - [evidence]" or "- [name]: NOT MET - [evidence]"
-                        # Evidence is optional
-                        checkpoint_pattern = r"-\s*(.+?):\s*(MET|NOT\s+MET)(?:\s*-\s*(.+?))?(?=\n-|\n\*\*|\Z)"
+                        # Parse individual checkpoints - handles both formats:
+                        # "- Name: MET - evidence" and "*   **Name:** MET - evidence"
+                        checkpoint_pattern = r"[*-]\s*\*{0,2}(.+?)\*{0,2}:\s*(MET|NOT\s+MET)(?:\s*-\s*(.+?))?(?=\n[*-]|\n\*\*|\Z)"
                         for cp_match in re.finditer(checkpoint_pattern, checkpoint_text, re.DOTALL | re.IGNORECASE):
                             cp_name = cp_match.group(1).strip()
                             cp_status = cp_match.group(2).strip().upper().replace(" ", "_")
                             cp_evidence = cp_match.group(3).strip() if cp_match.group(3) else ""
                             
-                            if cp_status == "MET":
-                                checkpoints_met.append({
-                                    "name": cp_name,
-                                    "evidence": cp_evidence
-                                })
-                            else:
-                                checkpoints_not_met.append({
-                                    "name": cp_name,
-                                    "evidence": cp_evidence
-                                })
+                            validation_results[cp_name] = {
+                                "status": cp_status,
+                                "evidence": cp_evidence
+                            }
                 
-                # Extract completion status
-                completion_pattern = rf"Phase {re.escape(phase_number)}:.*?Status:\s*(COMPLETED|PARTIAL|NOT_PERFORMED)"
+                # Build checkpoint groups from phase definition
+                for checkpoint in phase_checkpoints:
+                    checkpoint_name = checkpoint.get("name", "")
+                    requirements = checkpoint.get("requirements", [])
+                    blocking = checkpoint.get("blocking", False)
+                    
+                    requirement_items = []
+                    for req in requirements:
+                        # Try to find validation result for this requirement
+                        validation = validation_results.get(req, {})
+                        status = validation.get("status", "NOT_MET" if detected else "UNKNOWN")
+                        evidence = validation.get("evidence", "")
+                        
+                        requirement_items.append({
+                            "name": req,
+                            "status": status,
+                            "evidence": evidence
+                        })
+                    
+                    checkpoint_groups.append({
+                        "name": checkpoint_name,
+                        "blocking": blocking,
+                        "requirements": requirement_items
+                    })
+                
+                # Extract completion status from LLM response
+                completion_pattern = rf"\*{{0,2}}Phase {re.escape(phase_number)}:\*{{0,2}}.*?\*{{0,2}}Status:\*{{0,2}}\s*(COMPLETED|PARTIAL|NOT_PERFORMED)"
                 completion_match = re.search(completion_pattern, analysis, re.IGNORECASE | re.DOTALL)
                 if completion_match:
                     completion = completion_match.group(1).upper()
+                else:
+                    # Infer completion status if not explicitly stated
+                    if detected:
+                        # Count total requirements and met requirements from checkpoint groups
+                        total_reqs = sum(len(cg["requirements"]) for cg in checkpoint_groups)
+                        met_reqs = sum(1 for cg in checkpoint_groups for req in cg["requirements"] if req["status"] == "MET")
+                        
+                        if total_reqs == 0:
+                            # No checkpoints defined, assume completed if detected
+                            completion = "COMPLETED"
+                        elif met_reqs == total_reqs:
+                            # All checkpoints met
+                            completion = "COMPLETED"
+                        elif met_reqs > 0:
+                            # Some checkpoints met
+                            completion = "PARTIAL"
+                        else:
+                            # No checkpoints met but phase was detected
+                            completion = "PARTIAL"
+                    # else: remains "NOT_PERFORMED" (default)
+            else:
+                # Phase not detected - build checkpoint groups with UNKNOWN status
+                for checkpoint in phase_checkpoints:
+                    checkpoint_name = checkpoint.get("name", "")
+                    requirements = checkpoint.get("requirements", [])
+                    blocking = checkpoint.get("blocking", False)
+                    
+                    requirement_items = []
+                    for req in requirements:
+                        requirement_items.append({
+                            "name": req,
+                            "status": "UNKNOWN",
+                            "evidence": ""
+                        })
+                    
+                    checkpoint_groups.append({
+                        "name": checkpoint_name,
+                        "blocking": blocking,
+                        "requirements": requirement_items
+                    })
             
-            # Count total checkpoint requirements (not just checkpoint objects)
-            total_checkpoint_requirements = 0
-            for checkpoint in step.get("checkpoints", []):
-                total_checkpoint_requirements += len(checkpoint.get("requirements", []))
+            # Count total checkpoint requirements and satisfied count
+            total_checkpoint_requirements = sum(len(cg["requirements"]) for cg in checkpoint_groups)
+            checkpoints_satisfied = sum(1 for cg in checkpoint_groups for req in cg["requirements"] if req["status"] == "MET")
             
             detected_phases.append({
                 "phase_number": phase_number,
                 "phase_name": phase_name,
-                "description": step.get("description"),
+                "description": step.get("description"), 
                 "priority": step.get("priority"),
                 "detected": detected,
                 "completion": completion,
                 "evidence": evidence,
-                "checkpoints_met": checkpoints_met,
-                "checkpoints_not_met": checkpoints_not_met,
+                "checkpoint_groups": checkpoint_groups,
                 "total_checkpoints": total_checkpoint_requirements,
-                "checkpoints_satisfied": len(checkpoints_met)
+                "checkpoints_satisfied": checkpoints_satisfied
             })
         
-        # Extract error codes
-        # Handles formats like:
-        # - "C1 - description" 
-        # - "C1 (Checking Errors): description"
-        # - "- C1 (Checking Errors): description"
-        # Each error should be on its own line
-        error_pattern = r"^-?\s*(A\d+|C\d+|R\d+)\s*(?:\([^)]+\))?\s*[:-]\s*(.+?)$"
-        for error_match in re.finditer(error_pattern, analysis, re.MULTILINE):
+        # Extract error codes with timestamp and detailed description
+        # Formats to match:
+        # - **C1 (Checking Errors) at 00:03:** Description text
+        # - **A8 (Action Errors) at 05:23:** What happened - Specific evidence
+        # - C1 (Checking Errors): description (legacy format)
+        # Pattern handles optional markdown bold (**), optional category in parens, optional timestamp
+        error_pattern = r"-\s*\*{0,2}\s*(A\d+|C\d+|R\d+)\s*(?:\([^)]+\))?\s*(?:at\s+([\d:]+))?\s*\*{0,2}\s*:\s*\*{0,2}\s*(.+?)(?=\n-|\n\*\*|\Z)"
+        for error_match in re.finditer(error_pattern, analysis, re.MULTILINE | re.DOTALL):
             error_code = error_match.group(1)
-            error_description = error_match.group(2).strip()
-            # Clean up the description (remove extra whitespace and trailing periods)
+            timestamp = error_match.group(2) if error_match.group(2) else None
+            error_description = error_match.group(3).strip()
+            # Clean up the description (remove markdown bold markers, extra whitespace, newlines, and trailing periods)
+            error_description = error_description.replace('**', '').strip()
             error_description = ' '.join(error_description.split()).rstrip('.')
-            all_errors.append({
+            
+            error_entry = {
                 "code": error_code,
                 "description": error_description
-            })
+            }
+            
+            # Add timestamp if present
+            if timestamp:
+                error_entry["timestamp"] = timestamp
+            
+            all_errors.append(error_entry)
         
         # Calculate summary
         total_phases = len(procedure_steps)

@@ -521,30 +521,50 @@ function RecordedVideoComparisonPage() {
                         </div>
                       )}
 
-                      {/* Checkpoints for Outlier Mode */}
-                      {procedureSource === 'outlier' && item.total_checkpoints > 0 && (
-                        <div className="mt-3 space-y-2">
-                          <div className="flex items-center gap-2 text-sm font-medium">
-                            <span className="text-gray-700">
-                              Checkpoints: {item.checkpoints_satisfied}/{item.total_checkpoints}
-                            </span>
-                            {item.detected && item.checkpoints_satisfied === item.total_checkpoints && (
-                              <CheckCircle className="text-green-600" size={16} />
-                            )}
-                          </div>
-                          
-                          {item.checkpoints_met && item.checkpoints_met.length > 0 && (
-                            <div className="bg-green-50 rounded p-3 border border-green-200">
-                              <p className="text-sm font-medium text-green-800 mb-2">Checkpoints Met:</p>
-                              <div className="space-y-2">
-                                {item.checkpoints_met.map((cp, idx) => (
-                                  <div key={idx} className="flex items-start gap-2">
-                                    <CheckCircle className="text-green-600 flex-shrink-0 mt-0.5" size={16} />
+                      {/* Checkpoints for Outlier Mode - Grouped by checkpoint name */}
+                      {procedureSource === 'outlier' && item.checkpoint_groups && item.checkpoint_groups.length > 0 && (
+                        <div className="mt-4 space-y-3">
+                          {item.checkpoint_groups.map((group, groupIdx) => (
+                            <div key={groupIdx} className="bg-gray-50 rounded-lg p-4 border border-gray-200">
+                              <div className="flex items-center gap-2 mb-3">
+                                <div className="w-6 h-6 rounded-full bg-gray-300 flex items-center justify-center">
+                                  <span className="text-xs text-gray-700">○</span>
+                                </div>
+                                <div className="flex-1">
+                                  <span className="font-medium text-gray-900">{group.name}</span>
+                                  {group.blocking && (
+                                    <span className="ml-2 text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded font-medium">
+                                      BLOCKING
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                              
+                              <div className="ml-8 space-y-2">
+                                {group.requirements.map((req, reqIdx) => (
+                                  <div key={reqIdx} className="flex items-start gap-2">
+                                    {req.status === 'MET' ? (
+                                      <CheckCircle className="text-green-600 flex-shrink-0 mt-0.5" size={16} />
+                                    ) : req.status === 'NOT_MET' ? (
+                                      <XCircle className="text-red-600 flex-shrink-0 mt-0.5" size={16} />
+                                    ) : (
+                                      <div className="w-4 h-4 border-2 border-gray-300 rounded flex-shrink-0 mt-0.5" />
+                                    )}
                                     <div className="flex-1">
-                                      <p className="text-sm font-medium text-green-900">{cp.name}</p>
-                                      {cp.evidence && (
-                                        <p className="text-xs text-green-700 mt-1">
-                                          Evidence: {cp.evidence}
+                                      <p className={`text-sm ${
+                                        req.status === 'MET' ? 'text-green-900' : 
+                                        req.status === 'NOT_MET' ? 'text-red-900' : 
+                                        'text-gray-600'
+                                      }`}>
+                                        {req.name}
+                                      </p>
+                                      {req.evidence && (
+                                        <p className={`text-xs mt-1 ${
+                                          req.status === 'MET' ? 'text-green-700' : 
+                                          req.status === 'NOT_MET' ? 'text-red-700' : 
+                                          'text-gray-500'
+                                        }`}>
+                                          Evidence: {req.evidence}
                                         </p>
                                       )}
                                     </div>
@@ -552,28 +572,7 @@ function RecordedVideoComparisonPage() {
                                 ))}
                               </div>
                             </div>
-                          )}
-                          
-                          {item.checkpoints_not_met && item.checkpoints_not_met.length > 0 && (
-                            <div className="bg-red-50 rounded p-3 border border-red-200">
-                              <p className="text-sm font-medium text-red-800 mb-2">Checkpoints Not Met:</p>
-                              <div className="space-y-2">
-                                {item.checkpoints_not_met.map((cp, idx) => (
-                                  <div key={idx} className="flex items-start gap-2">
-                                    <XCircle className="text-red-600 flex-shrink-0 mt-0.5" size={16} />
-                                    <div className="flex-1">
-                                      <p className="text-sm font-medium text-red-900">{cp.name}</p>
-                                      {cp.evidence && (
-                                        <p className="text-xs text-red-700 mt-1">
-                                          Evidence: {cp.evidence}
-                                        </p>
-                                      )}
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          )}
+                          ))}
                         </div>
                       )}
                     </div>
@@ -595,9 +594,16 @@ function RecordedVideoComparisonPage() {
                   <div key={index} className="bg-red-50 border border-red-200 rounded-lg p-4">
                     <div className="flex items-start gap-2">
                       <AlertTriangle className="text-red-600 flex-shrink-0 mt-0.5" size={20} />
-                      <div>
-                        <span className="font-semibold text-red-700">{error.code}:</span>{' '}
-                        <span className="text-red-600">{error.description}</span>
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="font-semibold text-red-700">{error.code}</span>
+                          {error.timestamp && (
+                            <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded">
+                              {error.timestamp}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-sm text-red-600">{error.description}</p>
                       </div>
                     </div>
                   </div>

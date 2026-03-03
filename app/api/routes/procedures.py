@@ -19,6 +19,7 @@ from app.services.video_analysis import VideoAnalysisService
 from app.services.recorded_video_comparison import RecordedVideoComparisonService
 from app.services.chunked_video_comparison import ChunkedVideoComparisonService
 from app.services.video_upload import VideoUploadService
+from app.services.procedure_cache import ProcedureCache
 
 router = APIRouter()
 
@@ -181,11 +182,25 @@ async def compare_recorded_video(
         )
     
     try:
-        service = RecordedVideoComparisonService(db)
+        # Create procedure cache and load procedure data once
+        procedure_cache = ProcedureCache()
+        
+        # Load procedure data into cache (single DB query)
+        cached_data = await procedure_cache.load_procedure(
+            db, procedure_id, procedure_source
+        )
+        
+        # Close MongoDB connection to prevent background tasks
+        # The service will use cached data only
+        await db.client.close()
+        
+        # Run comparison with cached data (no DB access needed)
+        service = RecordedVideoComparisonService(db, procedure_cache)
         result = await service.compare_video(
             video_gs_uri=video_gs_uri,
             procedure_id=procedure_id,
-            procedure_source=procedure_source
+            procedure_source=procedure_source,
+            cached_procedure=cached_data
         )
         
         return result
@@ -256,7 +271,20 @@ async def compare_recorded_video_chunked(
             )
 
     try:
-        service = ChunkedVideoComparisonService(db)
+        # Create procedure cache and load procedure data once
+        procedure_cache = ProcedureCache()
+        
+        # Load procedure data into cache (single DB query)
+        cached_data = await procedure_cache.load_procedure(
+            db, procedure_id, procedure_source
+        )
+        
+        # Close MongoDB connection to prevent background tasks
+        # The service will use cached data only
+        await db.client.close()
+        
+        # Run comparison with cached data (no DB access needed)
+        service = ChunkedVideoComparisonService(db, procedure_cache)
         result = await service.compare_video(
             video_gs_uri=video_gs_uri,
             procedure_id=procedure_id,

@@ -27,6 +27,7 @@ import os
 from google.cloud import storage
 from app.services.gemini_client import GeminiClient
 from app.services.recorded_video_comparison import RecordedVideoComparisonService
+from app.services.procedure_cache import ProcedureCache
 from app.core.logging import logger
 from dotenv import load_dotenv
 load_dotenv()
@@ -197,11 +198,12 @@ class ChunkedVideoComparisonService:
     original RecordedVideoComparisonService for backward compatibility.
     """
 
-    def __init__(self, db: AsyncDatabase):
+    def __init__(self, db: AsyncDatabase, procedure_cache: Optional[ProcedureCache] = None):
         self.db = db
         self.gemini_client = GeminiClient()
+        self.procedure_cache = procedure_cache or ProcedureCache()
         # Reuse the original service for short videos and for result processing
-        self._original_service = RecordedVideoComparisonService(db)
+        self._original_service = RecordedVideoComparisonService(db, self.procedure_cache)
 
     async def compare_video(
         self,
@@ -242,7 +244,12 @@ class ChunkedVideoComparisonService:
                     procedure_source=procedure_source,
                 )
         
-        # If video is short, use original service
+        # Load procedure once and cache it
+        procedure, procedure_steps = await self.procedure_cache.load_procedure(
+            self.db, procedure_id, procedure_source
+        )
+        
+        # If video is short, use original service with cached data
         if video_duration_sec <= SHORT_VIDEO_THRESHOLD_SEC:
             logger.info(
                 "chunked_comparison_delegating_to_original",
@@ -254,6 +261,7 @@ class ChunkedVideoComparisonService:
                 video_gs_uri=video_gs_uri,
                 procedure_id=procedure_id,
                 procedure_source=procedure_source,
+                cached_procedure=(procedure, procedure_steps)
             )
 
         # Long video — use chunked approach
@@ -265,10 +273,7 @@ class ChunkedVideoComparisonService:
             video_duration_sec=video_duration_sec,
         )
 
-        # Load procedure (reuse from original service)
-        procedure, procedure_steps = await self._original_service._load_procedure(
-            procedure_id, procedure_source
-        )
+        # Procedure already loaded above and cached
 
         # Compute chunk windows
         windows = compute_chunk_windows(video_duration_sec)
