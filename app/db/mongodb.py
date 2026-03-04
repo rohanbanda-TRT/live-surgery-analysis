@@ -46,8 +46,27 @@ class MongoDB:
             logger.info("mongodb_disconnected")
     
     @classmethod
+    def _is_closed(cls) -> bool:
+        """Return True if the client has been closed or was never created."""
+        if cls.client is None:
+            return True
+        try:
+            topology = cls.client._topology
+            return topology._closed
+        except Exception:
+            return True
+
+    @classmethod
+    async def get_database_async(cls) -> AsyncDatabase:
+        """Get database instance, reconnecting automatically if the client was closed."""
+        if cls._is_closed():
+            logger.warning("mongodb_client_closed_reconnecting")
+            await cls.connect()
+        return cls.database
+
+    @classmethod
     def get_database(cls) -> AsyncDatabase:
-        """Get database instance."""
+        """Get database instance (sync accessor — assumes connect() was called)."""
         if cls.database is None:
             raise RuntimeError("Database not initialized. Call connect() first.")
         return cls.database
@@ -56,10 +75,11 @@ class MongoDB:
 async def get_db() -> AsyncDatabase:
     """
     Dependency to get database instance for route handlers.
-    
+    Auto-reconnects if the client was closed unexpectedly.
+
     Usage in routes:
         @router.get("/items")
         async def get_items(db: AsyncDatabase = Depends(get_db)):
             ...
     """
-    return MongoDB.get_database()
+    return await MongoDB.get_database_async()

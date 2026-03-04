@@ -190,10 +190,6 @@ async def compare_recorded_video(
             db, procedure_id, procedure_source
         )
         
-        # Close MongoDB connection to prevent background tasks
-        # The service will use cached data only
-        await db.client.close()
-        
         # Run comparison with cached data (no DB access needed)
         service = RecordedVideoComparisonService(db, procedure_cache)
         result = await service.compare_video(
@@ -278,10 +274,6 @@ async def compare_recorded_video_chunked(
         cached_data = await procedure_cache.load_procedure(
             db, procedure_id, procedure_source
         )
-        
-        # Close MongoDB connection to prevent background tasks
-        # The service will use cached data only
-        await db.client.close()
         
         # Run comparison with cached data (no DB access needed)
         service = ChunkedVideoComparisonService(db, procedure_cache)
