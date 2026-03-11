@@ -76,6 +76,13 @@ Organization: {outlier_procedure.get('organization')}
                 for req in checkpoint['requirements']:
                     context += f"    ✓ {req}\n"
         
+        # Alert questions (separate from checkpoints — AR yes/no decision-point questions)
+        if phase.get('alert_questions'):
+            context += "\nAlert Questions (must all be answered YES before proceeding):\n"
+            for aq in phase['alert_questions']:
+                blocking_marker = " [BLOCKING]" if aq.get('blocking', True) else ""
+                context += f"  ? {aq['question']}{blocking_marker}\n"
+        
         context += "\n"
     
     return context

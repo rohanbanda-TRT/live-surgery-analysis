@@ -15,6 +15,7 @@ from app.db.collections import create_indexes
 from app.api.routes import procedures, sessions, health, outlier_procedures
 from app.api.routes import sessions_v2
 from app.api.routes import sessions_v3
+from app.api.routes import livekit_sessions
 
 
 @asynccontextmanager
@@ -67,6 +68,7 @@ app.include_router(outlier_procedures.router, prefix="/api/outlier-procedures", 
 app.include_router(sessions.router, prefix="/api/sessions", tags=["sessions"])
 app.include_router(sessions_v2.router, prefix="/api/sessions-v2", tags=["sessions-v2"])
 app.include_router(sessions_v3.router, prefix="/api/sessions-v3", tags=["sessions-v3"])
+app.include_router(livekit_sessions.router, prefix="/api/livekit", tags=["livekit-sessions"])
 
 
 @app.get("/")

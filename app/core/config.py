@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4.1-mini"  # cheapest vision model with structured output
     OPENAI_TEMPERATURE: float = 0.1
+
+    # LiveKit Configuration (for V4 pipeline — Gemini Live API via LiveKit)
+    LIVEKIT_URL: str = ""
+    LIVEKIT_API_KEY: str = ""
+    LIVEKIT_API_SECRET: str = ""
+    GOOGLE_API_KEY: str = ""
     
     # Security
     SECRET_KEY: str

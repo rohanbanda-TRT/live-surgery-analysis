@@ -27,6 +27,11 @@ python-dotenv
 websockets
 python-socketio
 
+# LiveKit (V4 pipeline — Gemini Live API via LiveKit)
+livekit-api>=1.0.0
+livekit-agents[silero,google]~=1.4
+livekit-plugins-noise-cancellation~=0.2
+
 # Video Processing
 opencv-python-headless
 pillow

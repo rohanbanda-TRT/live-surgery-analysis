@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Video, CheckCircle, XCircle, AlertTriangle, Upload, Loader } from 'lucide-react';
+import { Video, CheckCircle, XCircle, AlertTriangle, Upload, Loader, Cpu } from 'lucide-react';
 import { proceduresAPI, outlierProceduresAPI } from '../services/api';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'https://surgery-analysis-api.demotrt.com';
@@ -11,6 +11,10 @@ function RecordedVideoComparisonPage() {
   const [videoDuration, setVideoDuration] = useState(null); // Duration in seconds
   const [procedureId, setProcedureId] = useState('');
   const [procedureSource, setProcedureSource] = useState('standard');
+  const [modelProvider, setModelProvider] = useState('gemini'); // 'gemini' or 'openai'
+  const [geminiModel, setGeminiModel] = useState('gemini-2.5-flash');
+  const [openaiModel, setOpenaiModel] = useState('gpt-4.1-mini');
+  const [openaiFrames, setOpenaiFrames] = useState(16);
   const [procedures, setProcedures] = useState([]);
   const [outlierProcedures, setOutlierProcedures] = useState([]);
   const [isUploading, setIsUploading] = useState(false);
@@ -24,6 +28,13 @@ function RecordedVideoComparisonPage() {
     loadProcedures();
     loadOutlierProcedures();
   }, []);
+
+  useEffect(() => {
+    if (modelProvider === 'openai') {
+      setInputMode('upload');
+      setVideoUrl('');
+    }
+  }, [modelProvider]);
 
   const loadProcedures = async () => {
     try {
@@ -109,7 +120,7 @@ function RecordedVideoComparisonPage() {
 
   const handleCompare = async () => {
     // Validation
-    if (inputMode === 'url' && !videoUrl) {
+    if (modelProvider === 'gemini' && inputMode === 'url' && !videoUrl) {
       setError('Please provide a video URL');
       return;
     }
@@ -128,7 +139,7 @@ function RecordedVideoComparisonPage() {
 
     try {
       // Step 1: Upload video if needed
-      if (inputMode === 'upload') {
+      if (modelProvider === 'gemini' && inputMode === 'upload') {
         finalVideoUrl = await uploadVideo();
         if (!finalVideoUrl) {
           throw new Error('Failed to get video URL after upload');
@@ -137,24 +148,47 @@ function RecordedVideoComparisonPage() {
 
       // Step 2: Analyze video
       setIsAnalyzing(true);
-      setCurrentStep('Analyzing video against procedure...');
 
-      const requestBody = {
-        video_gs_uri: finalVideoUrl,
-        procedure_id: procedureId,
-        procedure_source: procedureSource
-      };
+      let response;
+      if (modelProvider === 'openai') {
+        setCurrentStep('Analyzing video with OpenAI (frame sampling)...');
+        const formData = new FormData();
+        formData.append('file', selectedFile);
+        formData.append('procedure_id', procedureId);
+        formData.append('procedure_source', procedureSource);
+        if (openaiModel) {
+          formData.append('openai_model', openaiModel);
+        }
+        formData.append('num_frames', String(openaiFrames));
 
-      // Add video duration if available (enables automatic chunking for long videos)
-      if (videoDuration) {
-        requestBody.video_duration_sec = videoDuration;
+        response = await fetch(`${API_BASE_URL}/api/procedures/compare-with-upload`, {
+          method: 'POST',
+          body: formData
+        });
+      } else {
+        setCurrentStep('Analyzing video against procedure...');
+        const requestBody = {
+          video_gs_uri: finalVideoUrl,
+          procedure_id: procedureId,
+          procedure_source: procedureSource,
+          model_provider: 'gemini'
+        };
+
+        if (geminiModel) {
+          requestBody.gemini_model = geminiModel;
+        }
+
+        // Add video duration if available (enables automatic chunking for long videos)
+        if (videoDuration) {
+          requestBody.video_duration_sec = videoDuration;
+        }
+
+        response = await fetch(`${API_BASE_URL}/api/procedures/compare-chunked`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody)
+        });
       }
-
-      const response = await fetch(`${API_BASE_URL}/api/procedures/compare-chunked`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
-      });
 
       if (!response.ok) {
         const errorData = await response.json();
@@ -175,6 +209,20 @@ function RecordedVideoComparisonPage() {
 
   const currentProcedures = procedureSource === 'outlier' ? outlierProcedures : procedures;
   const items = results?.steps || results?.phases || [];
+  const isOutlier = procedureSource === 'outlier';
+  const alertSummary = isOutlier
+    ? items.reduce(
+        (acc, phase) => {
+          const total = phase.total_alert_questions ?? phase.alert_questions?.length ?? 0;
+          const passed = phase.alert_questions_passed ?? phase.alert_questions?.filter(q => q.passed).length ?? 0;
+          return {
+            total: acc.total + total,
+            passed: acc.passed + (passed || 0)
+          };
+        },
+        { passed: 0, total: 0 }
+      )
+    : { passed: 0, total: 0 };
 
   return (
     <div className="container mx-auto p-6 max-w-7xl">
@@ -233,6 +281,96 @@ function RecordedVideoComparisonPage() {
           </p>
         </div>
 
+        {/* Model Provider Selection */}
+        <div className="mb-6">
+          <label className="block text-sm font-medium text-gray-700 mb-2">
+            Model Provider
+          </label>
+          <div className="grid md:grid-cols-2 gap-4">
+            <button
+              type="button"
+              onClick={() => setModelProvider('gemini')}
+              className={`p-4 border rounded-lg text-left transition-all ${
+                modelProvider === 'gemini'
+                  ? 'border-blue-500 bg-blue-50'
+                  : 'border-gray-200 hover:border-blue-300'
+              }`}
+            >
+              <div className="flex items-center gap-2 mb-1">
+                <Cpu size={18} className="text-blue-600" />
+                <span className="font-semibold text-gray-900">Gemini (GCS URI)</span>
+              </div>
+              <p className="text-sm text-gray-600">
+                Directly analyzes GCS video URIs. Supports optional upload→GCS flow.
+              </p>
+              <p className="text-xs text-gray-500 mt-1">
+                Models: gemini-2.5-flash / gemini-2.5-pro
+              </p>
+            </button>
+            <button
+              type="button"
+              onClick={() => setModelProvider('openai')}
+              className={`p-4 border rounded-lg text-left transition-all ${
+                modelProvider === 'openai'
+                  ? 'border-purple-500 bg-purple-50'
+                  : 'border-gray-200 hover:border-purple-300'
+              }`}
+            >
+              <div className="flex items-center gap-2 mb-1">
+                <Cpu size={18} className="text-purple-600" />
+                <span className="font-semibold text-gray-900">OpenAI (Upload Only)</span>
+              </div>
+              <p className="text-sm text-gray-600">
+                Upload video, sample frames locally, analyze with GPT-4.1/4o vision.
+              </p>
+              <p className="text-xs text-gray-500 mt-1">
+                Higher cost but works without GCS access.
+              </p>
+            </button>
+          </div>
+
+          {modelProvider === 'gemini' ? (
+            <div className="mt-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">Gemini Model</label>
+              <select
+                value={geminiModel}
+                onChange={(e) => setGeminiModel(e.target.value)}
+                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              >
+                <option value="gemini-2.5-flash">gemini-2.5-flash (fast / cheaper)</option>
+                <option value="gemini-2.5-pro">gemini-2.5-pro (higher quality)</option>
+              </select>
+            </div>
+          ) : (
+            <div className="mt-4 grid md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">OpenAI Model</label>
+                <select
+                  value={openaiModel}
+                  onChange={(e) => setOpenaiModel(e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+                >
+                  <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+                  <option value="gpt-4o">gpt-4o</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Frames to Sample</label>
+                <input
+                  type="number"
+                  min={4}
+                  max={64}
+                  step={2}
+                  value={openaiFrames}
+                  onChange={(e) => setOpenaiFrames(Number(e.target.value) || 16)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+                />
+                <p className="text-xs text-gray-500 mt-1">More frames = better accuracy, higher cost.</p>
+              </div>
+            </div>
+          )}
+        </div>
+
         {/* Input Mode Toggle */}
         <div className="mb-6">
           <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -250,7 +388,7 @@ function RecordedVideoComparisonPage() {
                   ? 'bg-blue-600 text-white shadow-md'
                   : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
               }`}
-              disabled={isAnalyzing || isUploading}
+              disabled={isAnalyzing || isUploading || modelProvider === 'openai'}
             >
               GCS URL
             </button>
@@ -381,7 +519,13 @@ function RecordedVideoComparisonPage() {
         {/* Compare Button */}
         <button
           onClick={handleCompare}
-          disabled={isAnalyzing || isUploading || !procedureId || (inputMode === 'url' && !videoUrl) || (inputMode === 'upload' && !selectedFile)}
+          disabled={
+            isAnalyzing ||
+            isUploading ||
+            !procedureId ||
+            (modelProvider === 'gemini' && inputMode === 'url' && !videoUrl) ||
+            (inputMode === 'upload' && !selectedFile)
+          }
           className="w-full bg-blue-600 text-white py-3 px-6 rounded-lg font-semibold hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2"
         >
           {isUploading || isAnalyzing ? (
@@ -414,10 +558,21 @@ function RecordedVideoComparisonPage() {
         <div className="space-y-6">
           {/* Summary Card */}
           <div className="bg-white rounded-lg shadow-md p-6">
-            <h2 className="text-2xl font-bold mb-4">Analysis Results</h2>
-            <p className="text-gray-600 mb-4">
-              Procedure: <span className="font-semibold">{results.procedure_name}</span>
-            </p>
+            <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-4">
+              <div>
+                <h2 className="text-2xl font-bold">Analysis Results</h2>
+                <p className="text-gray-600">
+                  Procedure: <span className="font-semibold">{results.procedure_name}</span>
+                </p>
+              </div>
+              <div className="bg-gray-50 border border-gray-200 rounded-lg px-4 py-3 flex flex-col md:items-end">
+                <span className="text-xs uppercase tracking-wide text-gray-500">Model Used</span>
+                <span className="text-sm font-semibold text-gray-900">{results.model_used || 'gemini-2.5-flash'}</span>
+                {results.frames_analyzed && (
+                  <span className="text-xs text-gray-500">Frames analyzed: {results.frames_analyzed}</span>
+                )}
+              </div>
+            </div>
             
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <div className="bg-blue-50 rounded-lg p-4 text-center">
@@ -452,13 +607,23 @@ function RecordedVideoComparisonPage() {
                 </div>
               )}
               
-              {procedureSource === 'outlier' && (
-                <div className="bg-indigo-50 rounded-lg p-4 text-center">
-                  <div className="text-3xl font-bold text-indigo-600">
-                    {results.summary.checkpoints_met || 0}/{results.summary.total_checkpoints || 0}
+              {isOutlier && (
+                <>
+                  <div className="bg-indigo-50 rounded-lg p-4 text-center">
+                    <div className="text-3xl font-bold text-indigo-600">
+                      {results.summary.checkpoints_met || 0}/{results.summary.total_checkpoints || 0}
+                    </div>
+                    <div className="text-sm text-gray-600 mt-1">Checkpoints Met</div>
                   </div>
-                  <div className="text-sm text-gray-600 mt-1">Checkpoints Met</div>
-                </div>
+                  {alertSummary.total > 0 && (
+                    <div className="bg-purple-50 rounded-lg p-4 text-center">
+                      <div className="text-3xl font-bold text-purple-600">
+                        {alertSummary.passed}/{alertSummary.total}
+                      </div>
+                      <div className="text-sm text-gray-600 mt-1">Alert Questions Passed</div>
+                    </div>
+                  )}
+                </>
               )}
             </div>
           </div>
@@ -570,6 +735,63 @@ function RecordedVideoComparisonPage() {
                                     </div>
                                   </div>
                                 ))}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Alert Questions for Outlier Mode */}
+                      {procedureSource === 'outlier' && item.alert_questions && item.alert_questions.length > 0 && (
+                        <div className="mt-4 space-y-3">
+                          <div className="flex items-center gap-2 mb-2">
+                            <Video className="text-blue-600" size={18} />
+                            <span className="font-medium text-gray-900">Alert Questions</span>
+                            <span className="text-xs text-gray-500">
+                              ({item.alert_questions_passed || 0}/{item.total_alert_questions || item.alert_questions.length} passed)
+                            </span>
+                          </div>
+                          {item.alert_questions.map((aq, aqIdx) => (
+                            <div key={aqIdx} className={`rounded-lg p-4 border ${
+                              aq.passed 
+                                ? 'bg-blue-50 border-blue-300' 
+                                : 'bg-orange-50 border-orange-300'
+                            }`}>
+                              <div className="flex items-start gap-3">
+                                <div className={`w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5 ${
+                                  aq.passed 
+                                    ? 'bg-blue-600 text-white' 
+                                    : 'bg-orange-600 text-white'
+                                }`}>
+                                  <span className="text-xs font-bold">{aq.passed ? '✓' : '?'}</span>
+                                </div>
+                                <div className="flex-1">
+                                  <p className="font-medium text-gray-900 mb-1">{aq.question}</p>
+                                  <div className="flex items-center gap-3 text-sm mb-1">
+                                    <span className={`font-semibold ${
+                                      aq.answer === 'YES' ? 'text-green-700' : 
+                                      aq.answer === 'NO' ? 'text-red-700' : 
+                                      'text-gray-500'
+                                    }`}>
+                                      Answer: {aq.answer}
+                                    </span>
+                                    {aq.expected_answer && (
+                                      <span className="text-gray-600 text-xs">
+                                        (Expected: {aq.expected_answer})
+                                      </span>
+                                    )}
+                                    {aq.blocking && !aq.passed && (
+                                      <span className="text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded font-medium">
+                                        BLOCKING
+                                      </span>
+                                    )}
+                                  </div>
+                                  {aq.evidence && (
+                                    <p className="text-xs text-gray-600 italic mt-1">
+                                      Evidence: {aq.evidence}
+                                    </p>
+                                  )}
+                                </div>
                               </div>
                             </div>
                           ))}
