@@ -21,18 +21,21 @@ class LiveSurgeryWebSocket {
    * @param {string} procedureId - ID of the master procedure or outlier procedure
    * @param {string} surgeonId - ID of the surgeon
    * @param {string} procedureSource - 'standard' or 'outlier'
+   * @param {string} pipelineVersion - 'v1', 'v2', 'v3'
+   * @param {string} analysisMode - 'v1' or 'outlier_comparison'
    */
-  connect(sessionId, procedureId, surgeonId = 'default-surgeon', procedureSource = 'standard', pipelineVersion = 'v1') {
+  connect(sessionId, procedureId, surgeonId = 'default-surgeon', procedureSource = 'standard', pipelineVersion = 'v1', analysisMode = 'v1') {
     return new Promise((resolve, reject) => {
       this.sessionId = sessionId;
       this.procedureSource = procedureSource;
       this.pipelineVersion = pipelineVersion;
+      this.analysisMode = analysisMode;
       const sessionPath = pipelineVersion === 'v3' ? 'sessions-v3'
         : (pipelineVersion === 'v2') ? 'sessions-v2'
         : 'sessions';
       const wsUrl = `${WS_BASE_URL}/api/${sessionPath}/ws/${sessionId}`;
 
-      console.log(`Connecting to WebSocket: ${wsUrl} (pipeline: ${pipelineVersion})`);
+      console.log(`Connecting to WebSocket: ${wsUrl} (pipeline: ${pipelineVersion}, analysis: ${analysisMode})`);
 
       try {
         this.ws = new WebSocket(wsUrl);
@@ -46,6 +49,7 @@ class LiveSurgeryWebSocket {
             procedure_id: procedureId,
             surgeon_id: surgeonId,
             procedure_source: procedureSource,
+            analysis_mode: analysisMode,
           };
 
           this.ws.send(JSON.stringify(initMessage));

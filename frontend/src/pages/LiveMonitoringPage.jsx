@@ -22,6 +22,7 @@ function LiveMonitoringPage() {
   const [availableCameras, setAvailableCameras] = useState([]);
   const [selectedCameraId, setSelectedCameraId] = useState('');
   const [pipelineVersion, setPipelineVersion] = useState('v2');
+  const [comparisonMode, setComparisonMode] = useState('outlier_comparison'); // 'v1' or 'outlier_comparison'
   
   const wsRef = useRef(null);
   const videoRef = useRef(null);
@@ -191,7 +192,7 @@ function LiveMonitoringPage() {
       // Map analysisMode to procedure_source
       const procedureSource = analysisMode === 'error-resolution' ? 'outlier' : 'standard';
       
-      await wsRef.current.connect(sessionId, selectedProcedure, surgeonId, procedureSource, pipelineVersion);
+      await wsRef.current.connect(sessionId, selectedProcedure, surgeonId, procedureSource, pipelineVersion, comparisonMode);
       
     } catch (error) {
       addMessage('error', `Connection failed: ${error.message}`);
@@ -349,6 +350,46 @@ function LiveMonitoringPage() {
                   : 'V1: Legacy pipeline with ffmpeg + regex parsing'}
               </p>
             </div>
+
+            {/* Comparison Mode Toggle (for V1 only) */}
+            {pipelineVersion === 'v1' && (
+              <div className="mb-4">
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  V1 Analysis Mode
+                </label>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setComparisonMode('v1')}
+                    disabled={isConnected}
+                    className={`flex-1 py-2 px-3 rounded-md text-sm font-medium border transition-colors ${
+                      comparisonMode === 'v1'
+                        ? 'bg-gray-700 text-white border-gray-700'
+                        : 'bg-white text-gray-600 border-gray-300 hover:border-gray-400'
+                    } disabled:opacity-50 disabled:cursor-not-allowed`}
+                  >
+                    Standard
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setComparisonMode('outlier_comparison')}
+                    disabled={isConnected}
+                    className={`flex-1 py-2 px-3 rounded-md text-sm font-medium border transition-colors ${
+                      comparisonMode === 'outlier_comparison'
+                        ? 'bg-purple-600 text-white border-purple-600'
+                        : 'bg-white text-gray-600 border-gray-300 hover:border-gray-400'
+                    } disabled:opacity-50 disabled:cursor-not-allowed`}
+                  >
+                    Comparison
+                  </button>
+                </div>
+                <p className="mt-1 text-xs text-gray-500">
+                  {comparisonMode === 'outlier_comparison'
+                    ? 'Comparison: Uses chunked analysis with rolling history (like recorded video comparison)'
+                    : 'Standard: Traditional V1 live monitoring with cumulative tracking'}
+                </p>
+              </div>
+            )}
 
             {/* Analysis Mode Selection */}
             <div className="mb-4">
