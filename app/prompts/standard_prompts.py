@@ -94,6 +94,7 @@ def get_standard_chunk_analysis_prompt(
     remaining_context: str,
     history_context: str,
     cumulative_note: str,
+    ui_step_status_context: str,
     chunk_duration: int
 ) -> str:
     """
@@ -104,8 +105,9 @@ def get_standard_chunk_analysis_prompt(
         current_step: Current expected step details
         detected_context: Context of already detected steps
         remaining_context: Context of remaining steps
-        history_context: Recent analysis history
+        history_context: Recent analysis history (full text of all previous chunks)
         cumulative_note: Note about cumulative tracking
+        ui_step_status_context: Complete UI step status including checkpoints
         chunk_duration: Duration of video chunk in seconds
         
     Returns:
@@ -131,6 +133,7 @@ def get_standard_chunk_analysis_prompt(
 {cumulative_note}
 **REMAINING STEPS (FOCUS ON DETECTING THESE):** 
 {remaining_context}
+{ui_step_status_context}
 {history_context}
 **CRITICAL RULES - CUMULATIVE TRACKING:**
 1. This is CUMULATIVE analysis - once a step is detected, it REMAINS detected forever
@@ -140,9 +143,10 @@ def get_standard_chunk_analysis_prompt(
 5. Mark "completed" ONLY when you see clear evidence the step description is fulfilled
 6. "in-progress" is default - be conservative
 7. Verify actual surgical actions match the step description, not just instrument presence
-8. Review analysis history and master procedure definition before making status updates
+8. **Review the COMPLETE UI STEP STATUS and COMPLETE ANALYSIS HISTORY** - use all previous context
 9. Match visible instruments and anatomical landmarks against requirements
 10. **DO NOT re-detect already detected steps** - they remain in the detected list automatically
+11. **Use all previous chunk analyses** to understand progression and avoid contradictions
 
 **RESPONSE FORMAT:**
 Detected Step: [number] - [name]
@@ -152,7 +156,7 @@ Anatomical Landmarks: [list - compare to expected landmarks]
 Matches Expected: [yes/no - does video match master procedure definition?]
 Step Progress: [just-started/in-progress/nearing-completion/completed]
 Completion Evidence: [required if completed - what proves step description is fulfilled? else "N/A"]
-Analysis: [brief observation comparing video to master procedure]
+Analysis: [brief observation comparing video to master procedure and previous analyses]
 
 Analyze the video clip and respond:"""
 

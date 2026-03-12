@@ -556,7 +556,8 @@ class GeminiClient:
         self,
         video_data: bytes,
         prompt: str,
-        temperature: Optional[float] = None
+        temperature: Optional[float] = None,
+        response_schema: Optional[type] = None
     ) -> str:
         """
         Analyze a video chunk (short video clip).
@@ -565,9 +566,10 @@ class GeminiClient:
             video_data: Raw video data as bytes (MP4 format)
             prompt: Text prompt for analysis
             temperature: Model temperature
+            response_schema: Optional Pydantic model for structured JSON output
             
         Returns:
-            Analysis result as string
+            Analysis result as string (JSON if response_schema provided)
         """
         try:
             # Create content parts with video
@@ -577,14 +579,25 @@ class GeminiClient:
             ]
             
             # Configure generation
-            config = GenerateContentConfig(
-                temperature=temperature if temperature is not None else self.temperature,
-                # max_output_tokens=self.max_output_tokens
-            )
+            config_params = {
+                "temperature": temperature if temperature is not None else self.temperature,
+            }
+            
+            # Add JSON schema if provided
+            if response_schema:
+                config_params["response_mime_type"] = "application/json"
+                config_params["response_schema"] = response_schema
+                logger.info(
+                    "using_structured_json_output",
+                    schema=response_schema.__name__
+                )
+            
+            config = GenerateContentConfig(**config_params)
             
             logger.info(
                 "analyzing_video_chunk",
-                video_size_kb=len(video_data) / 1024
+                video_size_kb=len(video_data) / 1024,
+                structured_output=response_schema is not None
             )
             
             # Generate content

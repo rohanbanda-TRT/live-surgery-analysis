@@ -384,6 +384,9 @@ class LiveSurgeryService:
                     remaining_steps.append(step_detail)
             remaining_context = "\n".join(remaining_steps) if remaining_steps else "All steps detected!"
             
+            # Build complete UI step status context
+            ui_step_status_context = self._build_ui_step_status_context()
+            
             # Build list of detected step numbers
             detected_step_numbers = [
                 self.procedure_steps[i].get('step_number', i+1) 
@@ -391,24 +394,16 @@ class LiveSurgeryService:
             ]
             cumulative_note = f"\n**IMPORTANT:** Steps {', '.join(map(str, detected_step_numbers))} have been detected and should REMAIN detected. Focus on detecting remaining steps.\n" if detected_step_numbers else ""
             
-            # Build full chunk history context with complete analysis
+            # Build full chunk history context with COMPLETE analysis text
             history_context = ""
             if self.chunk_history:
-                # Show last 5 chunks with full analysis for better context
-                recent_history = self.chunk_history
+                # Pass ALL previous chunk analyses with full text for maximum context
                 history_lines = []
-                for idx, hist in enumerate(recent_history, start=len(self.chunk_history)-len(recent_history)+1):
-                    # Extract key information from analysis
-                    lines = hist.split('\n')
-                    detected_step = next((line for line in lines if 'Detected Step:' in line), 'Unknown')
-                    progress = next((line for line in lines if 'Step Progress:' in line), 'Unknown')
-                    matches = next((line for line in lines if 'Matches Expected:' in line), 'Unknown')
-                    
-                    history_lines.append(f"Chunk {idx}:")
-                    history_lines.append(f"  {detected_step}")
-                    history_lines.append(f"  {progress}")
-                    history_lines.append(f"  {matches}")
-                history_context = f"\n**Analysis History (Last {len(recent_history)} chunks):**\n" + "\n".join(history_lines) + "\n"
+                for idx, full_analysis in enumerate(self.chunk_history, start=1):
+                    history_lines.append(f"\n--- Chunk {idx} Analysis ---")
+                    history_lines.append(full_analysis)
+                    history_lines.append("--- End Chunk {idx} ---\n")
+                history_context = f"\n**COMPLETE ANALYSIS HISTORY ({len(self.chunk_history)} previous chunks):**\n" + "\n".join(history_lines) + "\n"
             
             # Build prompt based on procedure source
             if self.procedure_source == "outlier":
@@ -427,7 +422,8 @@ class LiveSurgeryService:
                     outlier_procedure=self.outlier_procedure,
                     detected_phases=detected_phase_numbers,
                     remaining_phases=remaining_phases,
-                    chunk_history=self.chunk_history
+                    chunk_history=self.chunk_history,
+                    ui_step_status_context=ui_step_status_context
                 )
             else:
                 # Use standard prompt for master procedures
@@ -440,6 +436,7 @@ class LiveSurgeryService:
                     remaining_context=remaining_context,
                     history_context=history_context,
                     cumulative_note=cumulative_note,
+                    ui_step_status_context=ui_step_status_context,
                     chunk_duration=len(chunk_data['frames'])
                 )
             
@@ -545,6 +542,23 @@ class LiveSurgeryService:
                     error_count=len(error_codes),
                     step_progress=step_progress
                 )
+                
+                # Create alerts for detected error codes
+                if error_codes:
+                    error_alerts = []
+                    for error in error_codes:
+                        error_alerts.append({
+                            "alert_type": f"error_{error.get('code', 'unknown').lower()}",
+                            "severity": error.get('severity', 'MEDIUM').lower(),
+                            "message": f"{error.get('code', 'Unknown')}: {error.get('description', 'Error detected')}",
+                            "metadata": {
+                                "error_code": error.get('code'),
+                                "description": error.get('description'),
+                                "phase": detected_phase_number,
+                                "blocking_checkpoints": error.get('blocking_checkpoints', [])
+                            }
+                        })
+                    await self._create_alerts(error_alerts)
             else:
                 # For standard mode: parse step index as before
                 detected_step_index = self._parse_detected_step(analysis)
@@ -567,7 +581,13 @@ class LiveSurgeryService:
             )
             
             # CUMULATIVE TRACKING: Add detected step to cumulative set (NEVER removed)
-            if detected_step_index is not None and matches_expected:
+            # For outlier mode: Track phases even if matches_expected=NO (for A8 errors, out-of-sequence detection)
+            # For standard mode: Only track if matches_expected=YES
+            should_track = detected_step_index is not None and (
+                matches_expected or self.procedure_source == "outlier"
+            )
+            
+            if should_track:
                 # Check if this is a new detection
                 is_new_detection = detected_step_index not in self.detected_steps_cumulative
                 
@@ -591,7 +611,9 @@ class LiveSurgeryService:
                         session_id=self.session_id,
                         step_index=detected_step_index,
                         step_name=self.procedure_steps[detected_step_index]['step_name'],
-                        total_detected=len(self.detected_steps_cumulative)
+                        total_detected=len(self.detected_steps_cumulative),
+                        matches_expected=matches_expected,
+                        procedure_source=self.procedure_source
                     )
                 else:
                     logger.debug(
@@ -1207,9 +1229,9 @@ Analysis: [detailed observation - what is the surgeon doing RIGHT NOW?]
             logger.error("failed_to_parse_completion_evidence", error=str(e))
             return None
     
-    async def _generate_missed_step_alert(self, step_index: int):
+    async def _create_missed_step_alert(self, step_index: int):
         """
-        Generate alert for a missed/skipped step.
+        Create alert for a missed/skipped step.
         
         Args:
             step_index: Index of the missed step
@@ -1229,6 +1251,15 @@ Analysis: [detailed observation - what is the surgeon doing RIGHT NOW?]
             }
         }
         await self._create_alerts([alert])
+    
+    async def _generate_missed_step_alert(self, step_index: int):
+        """
+        Generate alert for a missed/skipped step (alias for _create_missed_step_alert).
+        
+        Args:
+            step_index: Index of the missed step
+        """
+        await self._create_missed_step_alert(step_index)
     
     async def _create_alerts(self, alerts: List[Dict[str, Any]]):
         """
@@ -1275,6 +1306,78 @@ Analysis: [detailed observation - what is the surgeon doing RIGHT NOW?]
                 session_id=self.session_id,
                 error=str(e)
             )
+    
+    def _build_ui_step_status_context(self) -> str:
+        """
+        Build complete UI step status context to pass to AI for next chunk analysis.
+        This includes all step statuses, checkpoint completion (for outlier mode), etc.
+        
+        Returns:
+            Formatted string with complete UI step status information
+        """
+        try:
+            status_lines = []
+            status_lines.append("\n**COMPLETE UI STEP STATUS (What the user sees):**")
+            
+            for i, step in enumerate(self.procedure_steps):
+                step_number = step.get('step_number', i+1)
+                step_name = step['step_name']
+                status = self.step_status.get(i, "pending")
+                
+                # Build status line
+                if self.procedure_source == "outlier":
+                    # Outlier mode: include checkpoint information
+                    phase_number = step.get('phase_number')
+                    
+                    # Get checkpoint status if available
+                    checkpoint_info = ""
+                    if self.checkpoint_tracker and phase_number:
+                        cp_status = self.checkpoint_tracker.get_phase_checkpoint_status(phase_number)
+                        if cp_status.get('has_checkpoints'):
+                            completed_count = sum(1 for cp in cp_status.get('checkpoints', []) if cp.get('completed'))
+                            total_count = len(cp_status.get('checkpoints', []))
+                            checkpoint_info = f" | Checkpoints: {completed_count}/{total_count} complete"
+                            
+                            # List incomplete checkpoints
+                            incomplete = [cp['name'] for cp in cp_status.get('checkpoints', []) if not cp.get('completed')]
+                            if incomplete:
+                                checkpoint_info += f" | Pending: {', '.join(incomplete)}"
+                    
+                    # Determine display status
+                    if i in self.detected_steps_cumulative:
+                        if checkpoint_info and "Pending:" in checkpoint_info:
+                            display_status = "DETECTED (Partially Complete)"
+                        else:
+                            display_status = "COMPLETED"
+                    else:
+                        display_status = status.upper()
+                    
+                    status_lines.append(
+                        f"  Phase {phase_number}: {step_name} → {display_status}{checkpoint_info}"
+                    )
+                else:
+                    # Standard mode: simple status
+                    if i in self.detected_steps_cumulative:
+                        display_status = "COMPLETED ✓"
+                    else:
+                        display_status = status.upper()
+                    
+                    status_lines.append(
+                        f"  Step {step_number}: {step_name} → {display_status}"
+                    )
+            
+            status_lines.append("\n**KEY:**")
+            status_lines.append("  - COMPLETED: Step fully finished, all checkpoints done")
+            status_lines.append("  - DETECTED (Partially Complete): Step started but checkpoints pending")
+            status_lines.append("  - CURRENT: Currently expected step")
+            status_lines.append("  - PENDING: Not yet started")
+            status_lines.append("  - MISSED: Skipped or not detected when expected\n")
+            
+            return "\n".join(status_lines)
+            
+        except Exception as e:
+            logger.error("failed_to_build_ui_step_status_context", error=str(e))
+            return "\n**UI Step Status:** Error building status context\n"
     
     async def advance_step(self):
         """Manually advance to the next surgical step."""

@@ -85,7 +85,8 @@ def get_outlier_chunk_analysis_prompt(
     outlier_procedure: Dict[str, Any],
     detected_phases: set,
     remaining_phases: list,
-    chunk_history: list
+    chunk_history: list,
+    ui_step_status_context: str = ""
 ) -> str:
     """
     Generate prompt for analyzing video chunks using outlier resolution protocol.
@@ -96,7 +97,8 @@ def get_outlier_chunk_analysis_prompt(
         outlier_procedure: Complete outlier procedure from MongoDB
         detected_phases: Set of phase numbers already detected
         remaining_phases: List of phases not yet detected
-        chunk_history: Previous chunk analyses for context
+        chunk_history: Previous chunk analyses for context (full text of all previous chunks)
+        ui_step_status_context: Complete UI step status including checkpoint completion
         
     Returns:
         Comprehensive analysis prompt
@@ -139,13 +141,15 @@ def get_outlier_chunk_analysis_prompt(
         remaining_context += "All phases detected. Focus on final inspection and verification.\n"
     remaining_context += "\n"
     
-    # Build history context
+    # Build history context with COMPLETE analysis text
     history_context = ""
     if chunk_history:
-        history_context = "**RECENT ANALYSIS HISTORY:**\n"
-        for i, analysis in enumerate(chunk_history[-3:], 1):
-            history_context += f"{i}. {analysis[:200]}...\n"
-        history_context += "\n"
+        history_lines = []
+        for idx, full_analysis in enumerate(chunk_history, start=1):
+            history_lines.append(f"\n--- Chunk {idx} Analysis ---")
+            history_lines.append(full_analysis)
+            history_lines.append(f"--- End Chunk {idx} ---\n")
+        history_context = f"\n**COMPLETE ANALYSIS HISTORY ({len(chunk_history)} previous chunks):**\n" + "\n".join(history_lines) + "\n"
     
     prompt = f"""You are an AI surgical safety assistant analyzing live surgery using the Outlier Resolution Protocol.
 
@@ -154,6 +158,8 @@ def get_outlier_chunk_analysis_prompt(
 {detected_context}
 
 {remaining_context}
+
+{ui_step_status_context}
 
 {history_context}
 

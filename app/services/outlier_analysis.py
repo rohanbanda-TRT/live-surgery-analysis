@@ -24,14 +24,19 @@ class OutlierAnalysisParser:
         logger.debug("parse_detected_phase", analysis_preview=analysis[:200])
         
         # Look for "Detected Phase: 3.1" or similar patterns
+        # Also support comparison-style format: "**Phase 3.3: ...**\nDetected: YES"
         patterns = [
             r"Detected Phase:\s*(\d+\.\d+)",
             r"Current Phase:\s*(\d+\.\d+)",
             r"Phase\s+(\d+\.\d+)\s+detected",
+            # Comparison-style format: **Phase 3.3: Name**\nDetected: YES
+            r"\*\*Phase\s+(\d+\.\d+):[^\n]+\*\*\s*\n\s*Detected:\s*YES",
+            # Alternative: Phase 3.3: Name\nDetected: YES (without asterisks)
+            r"Phase\s+(\d+\.\d+):[^\n]+\n\s*Detected:\s*YES",
         ]
         
         for pattern in patterns:
-            match = re.search(pattern, analysis, re.IGNORECASE)
+            match = re.search(pattern, analysis, re.IGNORECASE | re.MULTILINE)
             if match:
                 phase_number = match.group(1)
                 logger.info("phase_detected_from_analysis", phase_number=phase_number, pattern=pattern)
@@ -68,12 +73,24 @@ class OutlierAnalysisParser:
             logger.info("checkpoint_status_parsed", status="FAIL")
         
         # Parse checkpoint details (individual requirement validations)
-        details_match = re.search(r"Checkpoint Details:\s*(.+?)(?=\n(?:Step Progress|Completion Evidence|Block Progression|Analysis):|$)", analysis, re.IGNORECASE | re.DOTALL)
-        if details_match:
-            details_text = details_match.group(1).strip()
+        # Support both old format "Checkpoint Details:" and comparison format "**CHECKPOINT VALIDATION:**"
+        details_patterns = [
+            r"Checkpoint Details:\s*(.+?)(?=\n(?:Step Progress|Completion Evidence|Block Progression|Analysis):|$)",
+            r"\*\*CHECKPOINT VALIDATION:\*\*\s*(.+?)(?=\n\*\*|$)",
+            r"CHECKPOINT VALIDATION:\s*(.+?)(?=\n\*\*|$)",
+        ]
+        
+        details_text = None
+        for pattern in details_patterns:
+            details_match = re.search(pattern, analysis, re.IGNORECASE | re.DOTALL)
+            if details_match:
+                details_text = details_match.group(1).strip()
+                break
+        
+        if details_text:
             # Parse individual checkpoint requirements
-            # Format: "Requirement name: MET/NOT MET/PREVIOUSLY_MET - Evidence"
-            requirement_pattern = r"[•\-]\s*(.+?):\s*(MET|NOT MET|PREVIOUSLY_MET|PREVIOUSLY MET)\s*[-–]\s*(.+?)(?=\n[•\-]|$)"
+            # Format: "- Requirement name: MET/NOT MET/PREVIOUSLY_MET - Evidence"
+            requirement_pattern = r"[•\-]\s*(.+?):\s*(MET|NOT MET|PREVIOUSLY_MET|PREVIOUSLY MET)\s*[-–]\s*(.+?)(?=\n[•\-]|\n\*\*|$)"
             for match in re.finditer(requirement_pattern, details_text, re.IGNORECASE | re.DOTALL):
                 requirement_name = match.group(1).strip()
                 status = match.group(2).strip().upper().replace(" ", "_")
