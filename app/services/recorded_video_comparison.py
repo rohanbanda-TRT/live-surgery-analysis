@@ -15,6 +15,7 @@ from app.prompts.outlier_prompts import build_outlier_resolution_context
 from app.prompts.standard_prompts import get_video_analysis_prompt
 from app.services.outlier_analysis import OutlierAnalysisParser, CheckpointTracker
 from app.services.procedure_cache import ProcedureCache
+from app.core.config import settings
 from app.core.logging import logger
 
 
@@ -29,16 +30,19 @@ class RecordedVideoComparisonService:
     - Overall comparison results
     """
     
-    def __init__(self, db: AsyncDatabase, procedure_cache: Optional[ProcedureCache] = None):
+    def __init__(self, db: AsyncDatabase, procedure_cache: Optional[ProcedureCache] = None, gemini_model: Optional[str] = None):
         """
         Initialize recorded video comparison service.
         
         Args:
             db: MongoDB database instance
             procedure_cache: Optional procedure cache to avoid repeated DB queries
+            gemini_model: Optional Gemini model override (e.g., 'gemini-2.5-flash', 'gemini-2.5-pro')
         """
         self.db = db
         self.gemini_client = GeminiClient()
+        if gemini_model:
+            self.gemini_client.model = gemini_model
         self.procedure_cache = procedure_cache or ProcedureCache()
     
     async def compare_video(
@@ -263,6 +267,15 @@ Example format:
 - Correct imaging available and verified: MET - X-ray and MRI shown
 - Level/laterality confirmed with fluoroscopy: NOT MET - No fluoroscopy shown
 
+**ALERT QUESTIONS ASSESSMENT:**
+IMPORTANT: Only answer the alert questions listed for this phase. Each must be answered YES or NO based on video evidence.
+For each alert question listed in the phase definition:
+- [Question text]: [YES/NO] - [Evidence from video]
+
+Example format:
+- Is the cannula positioning compatible with the defined target?: YES - Cannula clearly positioned at L4-L5 level
+- Are there signs of bleeding?: NO - Field is clear with no active bleeding visible
+
 **ERROR CODES DETECTED:**
 IMPORTANT: Error codes can occur multiple times at different points during surgery. List each occurrence separately with timestamp and specific details.
 Format for each error occurrence:
@@ -356,6 +369,7 @@ After analyzing all phases, provide:
             "procedure_source": "standard",
             "procedure_name": procedure.get("procedure_name"),
             "procedure_id": str(procedure["_id"]),
+            "model_used": self.gemini_client.model,
             "summary": {
                 "total_steps": total_steps,
                 "detected_steps": detected_count,
@@ -400,8 +414,12 @@ After analyzing all phases, provide:
             completion = "NOT_PERFORMED"
             checkpoint_groups = []  # Changed to grouped structure
             
-            # Get checkpoint definitions from procedure
+            # Get checkpoint and alert question definitions from procedure
             phase_checkpoints = step.get("checkpoints", [])
+            phase_alert_questions = step.get("alert_questions", [])
+            
+            # alert_questions result list (populated if phase detected)
+            alert_question_results = []
             
             if match:
                 detected = match.group(1).upper() == "YES"
@@ -412,35 +430,44 @@ After analyzing all phases, provide:
                 if evidence_match:
                     evidence = evidence_match.group(1).strip()[:200]
                 
-                # Extract checkpoint validation - only within this specific phase
-                # First, extract the entire phase section to avoid cross-phase contamination
+                # Extract the entire phase section to avoid cross-phase contamination
                 phase_section_pattern = rf"(\*{{0,2}}Phase {re.escape(phase_number)}:\*{{0,2}}.*?)(?=\n---\s*\n|\n\*{{0,2}}Phase \d+\.\d+:\*{{0,2}}|\Z)"
                 phase_section_match = re.search(phase_section_pattern, analysis, re.IGNORECASE | re.DOTALL)
                 
-                # Build validation results map
+                # Build checkpoint validation results map
                 validation_results = {}
+                # Build alert question answers map
+                alert_answers = {}
+                
                 if phase_section_match:
                     phase_section = phase_section_match.group(1)
                     
-                    # Now extract checkpoint validation within this phase section only
-                    checkpoint_section_pattern = r"\*{0,2}CHECKPOINT VALIDATION:\*{0,2}(.*?)(?=\*{0,2}ERROR CODES|\*{0,2}PHASE COMPLETION|\Z)"
+                    # Extract checkpoint validation within this phase section
+                    checkpoint_section_pattern = r"\*{0,2}CHECKPOINT VALIDATION:\*{0,2}(.*?)(?=\*{0,2}ALERT QUESTIONS|\*{0,2}ERROR CODES|\*{0,2}PHASE COMPLETION|\Z)"
                     checkpoint_section_match = re.search(checkpoint_section_pattern, phase_section, re.IGNORECASE | re.DOTALL)
                     
                     if checkpoint_section_match:
                         checkpoint_text = checkpoint_section_match.group(1)
-                        
-                        # Parse individual checkpoints - handles both formats:
-                        # "- Name: MET - evidence" and "*   **Name:** MET - evidence"
                         checkpoint_pattern = r"[*-]\s*\*{0,2}(.+?)\*{0,2}:\s*(MET|NOT\s+MET)(?:\s*-\s*(.+?))?(?=\n[*-]|\n\*\*|\Z)"
                         for cp_match in re.finditer(checkpoint_pattern, checkpoint_text, re.DOTALL | re.IGNORECASE):
                             cp_name = cp_match.group(1).strip()
                             cp_status = cp_match.group(2).strip().upper().replace(" ", "_")
                             cp_evidence = cp_match.group(3).strip() if cp_match.group(3) else ""
-                            
-                            validation_results[cp_name] = {
-                                "status": cp_status,
-                                "evidence": cp_evidence
-                            }
+                            validation_results[cp_name] = {"status": cp_status, "evidence": cp_evidence}
+                    
+                    # Extract alert question answers within this phase section
+                    alert_section_pattern = r"\*{0,2}ALERT QUESTIONS ASSESSMENT:\*{0,2}(.*?)(?=\*{0,2}ERROR CODES|\*{0,2}PHASE COMPLETION|\Z)"
+                    alert_section_match = re.search(alert_section_pattern, phase_section, re.IGNORECASE | re.DOTALL)
+                    
+                    if alert_section_match:
+                        alert_text = alert_section_match.group(1)
+                        # Pattern: "- Question text?: YES/NO - evidence"
+                        alert_pattern = r"[*-]\s*\*{0,2}(.+?\?)\*{0,2}:\s*(YES|NO)(?:\s*-\s*(.+?))?(?=\n[*-]|\n\*\*|\Z)"
+                        for aq_match in re.finditer(alert_pattern, alert_text, re.DOTALL | re.IGNORECASE):
+                            aq_text = aq_match.group(1).strip()
+                            aq_answer = aq_match.group(2).strip().upper()
+                            aq_evidence = aq_match.group(3).strip() if aq_match.group(3) else ""
+                            alert_answers[aq_text] = {"answer": aq_answer, "evidence": aq_evidence}
                 
                 # Build checkpoint groups from phase definition
                 for checkpoint in phase_checkpoints:
@@ -450,21 +477,38 @@ After analyzing all phases, provide:
                     
                     requirement_items = []
                     for req in requirements:
-                        # Try to find validation result for this requirement
                         validation = validation_results.get(req, {})
                         status = validation.get("status", "NOT_MET" if detected else "UNKNOWN")
                         evidence = validation.get("evidence", "")
-                        
-                        requirement_items.append({
-                            "name": req,
-                            "status": status,
-                            "evidence": evidence
-                        })
+                        requirement_items.append({"name": req, "status": status, "evidence": evidence})
                     
                     checkpoint_groups.append({
                         "name": checkpoint_name,
                         "blocking": blocking,
                         "requirements": requirement_items
+                    })
+                
+                # Build alert question results from phase definition
+                for aq_def in phase_alert_questions:
+                    aq_text = aq_def.get("question", "")
+                    expected = aq_def.get("expected_answer", "YES")
+                    blocking = aq_def.get("blocking", True)
+                    # Try exact match first, then fuzzy key search
+                    aq_result = alert_answers.get(aq_text)
+                    if not aq_result:
+                        for key, val in alert_answers.items():
+                            if aq_text.lower().strip("?") in key.lower() or key.lower().strip("?") in aq_text.lower():
+                                aq_result = val
+                                break
+                    answer = aq_result["answer"] if aq_result else ("UNKNOWN" if detected else "NOT_ASSESSED")
+                    aq_evidence = aq_result["evidence"] if aq_result else ""
+                    alert_question_results.append({
+                        "question": aq_text,
+                        "answer": answer,
+                        "expected_answer": expected,
+                        "passed": answer == expected,
+                        "blocking": blocking,
+                        "evidence": aq_evidence
                     })
                 
                 # Extract completion status from LLM response
@@ -475,25 +519,20 @@ After analyzing all phases, provide:
                 else:
                     # Infer completion status if not explicitly stated
                     if detected:
-                        # Count total requirements and met requirements from checkpoint groups
                         total_reqs = sum(len(cg["requirements"]) for cg in checkpoint_groups)
                         met_reqs = sum(1 for cg in checkpoint_groups for req in cg["requirements"] if req["status"] == "MET")
                         
                         if total_reqs == 0:
-                            # No checkpoints defined, assume completed if detected
                             completion = "COMPLETED"
                         elif met_reqs == total_reqs:
-                            # All checkpoints met
                             completion = "COMPLETED"
                         elif met_reqs > 0:
-                            # Some checkpoints met
                             completion = "PARTIAL"
                         else:
-                            # No checkpoints met but phase was detected
                             completion = "PARTIAL"
                     # else: remains "NOT_PERFORMED" (default)
             else:
-                # Phase not detected - build checkpoint groups with UNKNOWN status
+                # Phase not detected - build checkpoint groups and alert questions with UNKNOWN status
                 for checkpoint in phase_checkpoints:
                     checkpoint_name = checkpoint.get("name", "")
                     requirements = checkpoint.get("requirements", [])
@@ -501,21 +540,28 @@ After analyzing all phases, provide:
                     
                     requirement_items = []
                     for req in requirements:
-                        requirement_items.append({
-                            "name": req,
-                            "status": "UNKNOWN",
-                            "evidence": ""
-                        })
+                        requirement_items.append({"name": req, "status": "UNKNOWN", "evidence": ""})
                     
                     checkpoint_groups.append({
                         "name": checkpoint_name,
                         "blocking": blocking,
                         "requirements": requirement_items
                     })
+                
+                for aq_def in phase_alert_questions:
+                    alert_question_results.append({
+                        "question": aq_def.get("question", ""),
+                        "answer": "NOT_ASSESSED",
+                        "expected_answer": aq_def.get("expected_answer", "YES"),
+                        "passed": False,
+                        "blocking": aq_def.get("blocking", True),
+                        "evidence": ""
+                    })
             
             # Count total checkpoint requirements and satisfied count
             total_checkpoint_requirements = sum(len(cg["requirements"]) for cg in checkpoint_groups)
             checkpoints_satisfied = sum(1 for cg in checkpoint_groups for req in cg["requirements"] if req["status"] == "MET")
+            alert_questions_passed = sum(1 for aq in alert_question_results if aq["passed"])
             
             detected_phases.append({
                 "phase_number": phase_number,
@@ -527,7 +573,10 @@ After analyzing all phases, provide:
                 "evidence": evidence,
                 "checkpoint_groups": checkpoint_groups,
                 "total_checkpoints": total_checkpoint_requirements,
-                "checkpoints_satisfied": checkpoints_satisfied
+                "checkpoints_satisfied": checkpoints_satisfied,
+                "alert_questions": alert_question_results,
+                "alert_questions_passed": alert_questions_passed,
+                "total_alert_questions": len(alert_question_results)
             })
         
         # Extract error codes with timestamp and detailed description
@@ -567,6 +616,7 @@ After analyzing all phases, provide:
             "procedure_source": "outlier",
             "procedure_name": procedure.get("procedure_name"),
             "procedure_id": str(procedure["_id"]),
+            "model_used": self.gemini_client.model,
             "summary": {
                 "total_phases": total_phases,
                 "detected_phases": detected_count,

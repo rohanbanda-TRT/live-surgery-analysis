@@ -474,8 +474,11 @@ class GeminiClient:
                 has_system_instruction=bool(system_instruction),
             )
 
-            # Generate content (sync call — google-genai handles async internally)
-            response = self.client.models.generate_content(
+            # Run synchronous generate_content in a thread so the asyncio
+            # event loop is not blocked during the Gemini API call.
+            # This allows WebSocket frame buffering to continue concurrently.
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
                 model=self.model,
                 contents=contents,
                 config=config,
@@ -502,6 +505,89 @@ class GeminiClient:
             logger.error(
                 "frames_analysis_failed",
                 frame_count=len(frames),
+                error=str(e),
+            )
+            raise
+
+    async def analyze_video_chunk_inline(
+        self,
+        video_bytes: bytes,
+        prompt: str,
+        response_schema: dict,
+        system_instruction: Optional[str] = None,
+        temperature: Optional[float] = None,
+    ) -> dict:
+        """
+        Analyze a video chunk by sending raw MP4 bytes inline to Gemini.
+
+        Args:
+            video_bytes: Raw MP4 video bytes (created from captured frames)
+            prompt: Dynamic per-chunk prompt (includes current state + history context)
+            response_schema: JSON schema dict for structured output
+            system_instruction: Static system context (procedure details, set once per session)
+            temperature: Optional temperature override
+
+        Returns:
+            Parsed JSON dict matching response_schema
+        """
+        try:
+            contents = [
+                Part.from_bytes(data=video_bytes, mime_type="video/mp4"),
+                prompt,
+            ]
+
+            config = GenerateContentConfig(
+                temperature=temperature if temperature is not None else self.temperature,
+                response_mime_type="application/json",
+                response_json_schema=response_schema,
+            )
+            if system_instruction:
+                config.system_instruction = system_instruction
+
+            logger.info(
+                "analyzing_video_chunk_inline",
+                video_size_kb=len(video_bytes) // 1024,
+                model=self.model,
+                prompt_length=len(prompt),
+                has_system_instruction=bool(system_instruction),
+            )
+
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model=self.model,
+                contents=contents,
+                config=config,
+            )
+
+            logger.info(
+                "gemini_raw_response",
+                video_size_kb=len(video_bytes) // 1024,
+                raw_response=response.text,
+            )
+
+            result = json.loads(response.text)
+
+            logger.info(
+                "video_chunk_analysis_completed",
+                video_size_kb=len(video_bytes) // 1024,
+                detected_step=result.get("detected_step_number") or result.get("detected_phase_number"),
+                confidence=result.get("confidence_score"),
+                significant_change=result.get("significant_change"),
+                observation=result.get("observation", "")[:120],
+            )
+            return result
+
+        except json.JSONDecodeError as e:
+            logger.error(
+                "video_chunk_json_parse_failed",
+                error=str(e),
+                response_preview=response.text[:500] if response else "N/A",
+            )
+            raise
+        except Exception as e:
+            logger.error(
+                "video_chunk_inline_analysis_failed",
+                video_size_kb=len(video_bytes) // 1024,
                 error=str(e),
             )
             raise

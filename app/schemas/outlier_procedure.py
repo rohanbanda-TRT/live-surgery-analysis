@@ -37,6 +37,13 @@ class Checkpoint(BaseModel):
     blocking: bool = Field(default=True, description="Does this block progression if not met")
 
 
+class AlertQuestion(BaseModel):
+    """AR alert question asked to surgeon at decision point within a phase"""
+    question: str = Field(..., description="The yes/no question to verify before proceeding")
+    expected_answer: str = Field(default="YES", description="Expected answer (YES/NO)")
+    blocking: bool = Field(default=True, description="Does a wrong answer block progression")
+
+
 class SubTask(BaseModel):
     """Sub-task within a phase"""
     task_name: str = Field(..., description="Name of the sub-task")
@@ -54,6 +61,7 @@ class SurgicalPhase(BaseModel):
     critical_errors: List[CriticalError] = Field(default_factory=list, description="Errors that can occur")
     prevention_strategies: List[PreventionStrategy] = Field(default_factory=list, description="How to prevent errors")
     checkpoints: List[Checkpoint] = Field(default_factory=list, description="Safety checkpoints for this phase")
+    alert_questions: List[AlertQuestion] = Field(default_factory=list, description="AR alert questions asked to surgeon at decision points")
     dependencies: List[str] = Field(default_factory=list, description="Phase numbers that must be completed first")
     priority: str = Field(..., description="Overall priority level (HIGH/MEDIUM/LOW)")
     anatomical_landmarks: List[str] = Field(default_factory=list, description="Key landmarks to identify")

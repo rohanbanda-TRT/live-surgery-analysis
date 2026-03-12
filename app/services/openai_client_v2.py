@@ -26,6 +26,8 @@ from openai import AsyncOpenAI
 from typing import Optional, List, Any
 import base64
 import json
+import tempfile
+import os
 
 from app.core.config import settings
 from app.core.logging import logger
@@ -160,6 +162,116 @@ class OpenAIClientV2:
                 error=str(e),
             )
             raise
+
+
+    async def analyze_video_from_file(
+        self,
+        video_bytes: bytes,
+        prompt: str,
+        num_frames: int = 16,
+        detail: str = "low",
+        temperature: Optional[float] = None,
+    ) -> str:
+        """
+        Analyze a video uploaded as raw bytes by extracting evenly-spaced frames.
+
+        Used when model_provider='openai' — the video is uploaded directly
+        (not a GCS URI). Frames are extracted with cv2 and sent as base64 images.
+
+        Args:
+            video_bytes: Raw video file bytes
+            prompt: Analysis prompt
+            num_frames: How many frames to sample across the video (default 16)
+            detail: "low" (cheap) or "high" (precise)
+            temperature: Override temperature
+
+        Returns:
+            Analysis result as text string
+        """
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            raise ValueError(
+                "opencv-python is required for OpenAI video analysis. "
+                "Install it with: pip install opencv-python-headless"
+            )
+
+        # Write bytes to temp file so cv2 can open it
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp.write(video_bytes)
+            tmp_path = tmp.name
+
+        try:
+            cap = cv2.VideoCapture(tmp_path)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames <= 0:
+                raise ValueError("Could not read frames from uploaded video file")
+
+            # Sample evenly-spaced frame indices
+            indices = [int(i * total_frames / num_frames) for i in range(num_frames)]
+
+            frames: List[bytes] = []
+            for idx in indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ret, frame = cap.read()
+                if ret:
+                    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    frames.append(buf.tobytes())
+            cap.release()
+
+            if not frames:
+                raise ValueError("No frames could be extracted from the uploaded video")
+
+            logger.info(
+                "openai_video_frames_extracted",
+                total_video_frames=total_frames,
+                frames_sampled=len(frames),
+            )
+        finally:
+            os.unlink(tmp_path)
+
+        # Build content: all frames as images + text prompt
+        content: List[Any] = []
+        for frame_data in frames:
+            b64 = base64.b64encode(frame_data).decode("utf-8")
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{b64}",
+                    "detail": detail,
+                },
+            })
+        content.append({"type": "text", "text": prompt})
+
+        messages = [{"role": "user", "content": content}]
+
+        logger.info(
+            "openai_analyzing_video_file",
+            frames_sent=len(frames),
+            model=self.model,
+            detail=detail,
+            prompt_length=len(prompt),
+        )
+
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=temperature if temperature is not None else self.temperature,
+        )
+
+        result = response.choices[0].message.content
+
+        logger.info(
+            "openai_video_analysis_completed",
+            frames_sent=len(frames),
+            model=self.model,
+            usage_input=response.usage.prompt_tokens if response.usage else 0,
+            usage_output=response.usage.completion_tokens if response.usage else 0,
+            response_length=len(result),
+        )
+
+        return result
 
 
 # ──────────────────────────────────────────────

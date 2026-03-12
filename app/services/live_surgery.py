@@ -6,15 +6,24 @@ from bson import ObjectId
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 import asyncio
+import os
+import tempfile
 import cv2
 import numpy as np
 
 from app.services.gemini_client import GeminiClient
-from app.db.collections import MASTER_PROCEDURES, SURGICAL_STEPS, LIVE_SESSIONS, SESSION_ALERTS, OUTLIER_PROCEDURES
+from app.db.collections import MASTER_PROCEDURES, LIVE_SESSIONS, SESSION_ALERTS, OUTLIER_PROCEDURES
 from app.core.logging import logger
-from app.prompts.outlier_prompts import get_outlier_chunk_analysis_prompt
-from app.prompts.standard_prompts import get_standard_chunk_analysis_prompt
-from app.services.outlier_analysis import OutlierAnalysisParser, CheckpointTracker
+from app.services.outlier_analysis import CheckpointTracker
+from app.services.analysis_schemas import get_standard_chunk_schema, get_outlier_chunk_schema
+from app.prompts.prompts_v2 import (
+    build_standard_system_instruction,
+    build_outlier_system_instruction,
+    build_standard_chunk_prompt,
+    build_outlier_chunk_prompt,
+    build_chunk_history_summary,
+    CONFIDENCE_THRESHOLD,
+)
 
 
 class LiveSurgeryService:
@@ -44,23 +53,26 @@ class LiveSurgeryService:
         
         # Previous analysis for context awareness
         self.previous_analysis: Optional[str] = None
-        self.chunk_history: List[str] = []  # Full history of all chunk analyses (last 10)
+        self.chunk_history: List[dict] = []  # Structured dicts from analyze_frames_structured (last 10)
+
+        # System instruction (built once at session start, reused every chunk)
+        self._system_instruction: Optional[str] = None
         
         # Cumulative step tracking (like reference implementation)
         self.detected_steps_cumulative: set = set()  # Steps that have been detected (NEVER removed)
         self.step_status: Dict[int, str] = {}  # step_index -> status (pending/detected/missed)
-        self.step_detection_history: Dict[int, List[str]] = {}  # step_index -> list of detection analyses
+        self.step_detection_history: Dict[int, List[dict]] = {}  # step_index -> list of detection dicts
         self.phase_number_to_index: Dict[str, int] = {}  # For outlier mode: phase_number -> index mapping
         
         # Outlier mode: checkpoint tracking
         self.checkpoint_tracker: Optional[CheckpointTracker] = None
-        self.outlier_parser = OutlierAnalysisParser()
         
         # Video chunk processing
+        # 5 frames @ 1 FPS = 5s window; overlap=1 means new chunk every 4s
         self.frame_buffer: List[bytes] = []
         self.frame_count: int = 0
-        self.chunk_size: int = 7  # 7 seconds at 1 FPS
-        self.chunk_overlap: int = 2  # 2 second overlap
+        self.chunk_size: int = 5   # reduced from 7 — smaller window = faster first result
+        self.chunk_overlap: int = 1  # reduced from 2 — 4s cadence instead of 5s
         self.chunk_queue: asyncio.Queue = asyncio.Queue()
         self.is_processing_chunks: bool = False
         self.chunk_task: Optional[asyncio.Task] = None
@@ -159,7 +171,10 @@ class LiveSurgeryService:
                     procedure_name=self.master_procedure.get("procedure_name"),
                     steps_count=len(self.procedure_steps)
                 )
-            
+        
+            # Build system instruction once (reused every chunk — static context)
+            self._build_system_instruction()
+        
             # Initialize all steps as pending
             for i in range(len(self.procedure_steps)):
                 self.step_status[i] = "pending"
@@ -258,809 +273,597 @@ class LiveSurgeryService:
                 error=str(e)
             )
     
+    def _build_system_instruction(self):
+        """Build static system instruction once per session (reused on every chunk call)."""
+        if self.procedure_source == "outlier" and self.outlier_procedure:
+            self._system_instruction = build_outlier_system_instruction(
+                outlier_procedure=self.outlier_procedure
+            )
+        elif self.master_procedure:
+            self._system_instruction = build_standard_system_instruction(
+                procedure_name=self.master_procedure.get("procedure_name", "Unknown"),
+                procedure_steps=self.procedure_steps,
+            )
+        logger.info(
+            "system_instruction_built",
+            session_id=self.session_id,
+            procedure_source=self.procedure_source,
+            length=len(self._system_instruction) if self._system_instruction else 0,
+        )
+
     async def _process_chunk_queue(self):
-        """Background task to process video chunks from queue."""
+        """
+        Background task to process video chunks.
+
+        Pull-latest-discard-stale pattern (inspired by LiveRequest Queue):
+        If analysis has fallen behind and multiple chunks are queued, skip
+        all intermediate ones and jump directly to the most recent state.
+        This ensures Gemini always sees the CURRENT surgical field, not a
+        backlog from seconds ago.
+        """
         try:
             while self.is_processing_chunks:
                 try:
-                    # Get next chunk from queue (wait up to 1 second)
+                    # Wait for at least one chunk
                     chunk_data = await asyncio.wait_for(
                         self.chunk_queue.get(),
                         timeout=1.0
                     )
-                    
+
+                    # Drain any additional queued chunks — keep only the latest
+                    skipped = 0
+                    while not self.chunk_queue.empty():
+                        try:
+                            chunk_data = self.chunk_queue.get_nowait()
+                            skipped += 1
+                        except asyncio.QueueEmpty:
+                            break
+
+                    if skipped:
+                        logger.info(
+                            "stale_chunks_discarded",
+                            session_id=self.session_id,
+                            skipped=skipped,
+                            analyzing_frame=chunk_data["end_frame"],
+                        )
+
                     logger.info(
                         "processing_chunk",
                         session_id=self.session_id,
                         start_frame=chunk_data["start_frame"],
                         end_frame=chunk_data["end_frame"],
-                        queue_remaining=self.chunk_queue.qsize()
+                        queue_remaining=self.chunk_queue.qsize(),
                     )
-                    
-                    # Analyze the video chunk
+
                     await self._analyze_video_chunk(chunk_data)
-                    
+
                 except asyncio.TimeoutError:
-                    # No chunks in queue, continue waiting
                     continue
                 except Exception as e:
                     logger.error(
                         "chunk_processing_error",
                         session_id=self.session_id,
-                        error=str(e)
+                        error=str(e),
                     )
-                    
+
         except asyncio.CancelledError:
             logger.info(
                 "chunk_processing_cancelled",
-                session_id=self.session_id
+                session_id=self.session_id,
             )
         except Exception as e:
             logger.error(
                 "chunk_queue_handler_failed",
                 session_id=self.session_id,
-                error=str(e)
+                error=str(e),
             )
     
     def _create_video_from_frames(self, frames: List[bytes]) -> bytes:
-        """Create a video file from frame images."""
-        import tempfile
-        import subprocess
+        """
+        Encode JPEG frames into an MP4 video using OpenCV — no subprocess, no ffmpeg.
+        The video is written to a temp file then read back as bytes and deleted.
+        """
+        tmp_path = None
+        try:
+            first = cv2.imdecode(np.frombuffer(frames[0], np.uint8), cv2.IMREAD_COLOR)
+            if first is None:
+                raise ValueError("Failed to decode first frame")
+            h, w = first.shape[:2]
+
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                tmp_path = tmp.name
+
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(tmp_path, fourcc, 1.0, (w, h))
+            writer.write(first)
+            for frame_bytes in frames[1:]:
+                frame = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
+                if frame is not None:
+                    writer.write(frame)
+            writer.release()
+
+            with open(tmp_path, "rb") as f:
+                return f.read()
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+    def _build_previous_analysis_context(self) -> str:
+        """
+        Build complete history of ALL previous chunk analyses so Gemini has
+        full temporal continuity and cumulative context.
         
-        try:
-            # Create temp directory for frames
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # Save frames as images
-                for i, frame_data in enumerate(frames):
-                    frame_path = f"{temp_dir}/frame_{i:04d}.jpg"
-                    with open(frame_path, 'wb') as f:
-                        f.write(frame_data)
-                
-                # Create video using ffmpeg
-                output_path = f"{temp_dir}/chunk.mp4"
-                subprocess.run([
-                    'ffmpeg', '-y',
-                    '-framerate', '1',  # 1 FPS
-                    '-i', f'{temp_dir}/frame_%04d.jpg',
-                    '-c:v', 'libx264',
-                    '-pix_fmt', 'yuv420p',
-                    '-movflags', '+faststart',
-                    output_path
-                ], check=True, capture_output=True)
-                
-                # Read video file
-                with open(output_path, 'rb') as f:
-                    return f.read()
-                    
-        except Exception as e:
-            logger.error(
-                "video_creation_failed",
-                session_id=self.session_id,
-                error=str(e)
-            )
-            raise
-    
+        Includes: detected steps/phases, confidence scores, progress status,
+        checkpoint validations, completion evidence for every chunk.
+        """
+        if not self.chunk_history:
+            return ""
+
+        lines = [f"COMPLETE ANALYSIS HISTORY ({len(self.chunk_history)} chunks analyzed):"]
+        lines.append("")
+
+        for idx, entry in enumerate(self.chunk_history, start=1):
+            # Header for this chunk
+            step_or_phase = entry.get("detected_step_number") or entry.get("detected_phase_number") or "None"
+            confidence = entry.get("confidence_score", 0)
+            lines.append(f"CHUNK {idx}:")
+            lines.append(f"  Detected: Step/Phase {step_or_phase} (confidence: {confidence}%)")
+            
+            # Confidence reasoning
+            if entry.get("confidence_reason"):
+                lines.append(f"  Confidence reason: {entry['confidence_reason']}")
+            
+            # Progress and action
+            progress = entry.get("step_progress", "unknown")
+            lines.append(f"  Progress: {progress}")
+            
+            if entry.get("action_observed"):
+                lines.append(f"  Action: {entry['action_observed'][:120]}")
+            
+            # Completion evidence
+            if entry.get("completion_evidence"):
+                lines.append(f"  Completion evidence: {entry['completion_evidence'][:100]}")
+            
+            # Checkpoint validations (outlier mode)
+            checkpoints = entry.get("checkpoint_validations", [])
+            if checkpoints:
+                lines.append(f"  Checkpoints validated:")
+                for cp in checkpoints[:5]:  # Limit to 5 per chunk to avoid token overflow
+                    cp_name = cp.get("checkpoint_name", "?")
+                    status = cp.get("status", "?")
+                    req = cp.get("requirement", "")[:60]
+                    lines.append(f"    • [{cp_name}] {req} → {status}")
+            
+            # Error codes (outlier mode)
+            errors = entry.get("error_codes", [])
+            if errors:
+                error_summary = ", ".join([e.get("code", "?") for e in errors[:3]])
+                lines.append(f"  Errors detected: {error_summary}")
+            
+            # Summary
+            if entry.get("analysis_summary"):
+                lines.append(f"  Summary: {entry['analysis_summary'][:150]}")
+            
+            lines.append("")  # Blank line between chunks
+
+        # Add cumulative detection summary
+        lines.append(f"CUMULATIVE STATUS:")
+        lines.append(f"  Total steps/phases detected so far: {len(self.detected_steps_cumulative)}")
+        if self.detected_steps_cumulative:
+            detected_names = [
+                self.procedure_steps[i].get("step_name") or self.procedure_steps[i].get("phase_name", f"#{i}")
+                for i in sorted(self.detected_steps_cumulative)
+                if i < len(self.procedure_steps)
+            ]
+            lines.append(f"  Detected: {', '.join(detected_names[:10])}")
+
+        return "\n".join(lines)
+
     async def _analyze_video_chunk(self, chunk_data: Dict[str, Any]):
-        """Analyze a video chunk."""
+        """
+        Analyze a video chunk by:
+          1. Encoding JPEG frames → MP4 via OpenCV (no subprocess)
+          2. Building a structured prompt that includes full previous-analysis context
+          3. Sending the video inline to Gemini with structured JSON output
+        """
         try:
-            # Early exit if session is stopped
             if not self.is_processing_chunks:
                 logger.info(
                     "chunk_skipped_session_stopped",
                     session_id=self.session_id,
                     start_frame=chunk_data.get("start_frame"),
-                    end_frame=chunk_data.get("end_frame")
+                    end_frame=chunk_data.get("end_frame"),
                 )
                 return
-            
+
             if not self.procedure_steps or self.current_step_index >= len(self.procedure_steps):
                 return
-            
+
             current_step = self.procedure_steps[self.current_step_index]
-            
-            # Create video from frames
-            video_data = self._create_video_from_frames(chunk_data["frames"])
-            
-            # Build cumulative detected steps context (like reference implementation)
-            detected_steps = []
-            for i in sorted(self.detected_steps_cumulative):
-                s = self.procedure_steps[i]
-                step_info = f"✓ Step {s.get('step_number', i+1)}: {s['step_name']}"
-                # Add detection history if available
-                if i in self.step_detection_history and self.step_detection_history[i]:
-                    last_detection = self.step_detection_history[i][-1]
-                    step_info += f" (Last seen: {last_detection[:100]}...)"
-                detected_steps.append(step_info)
-            detected_context = "\n".join(detected_steps) if detected_steps else "None yet"
-            
-            # Build remaining steps (not yet detected)
-            remaining_steps = []
-            for i, s in enumerate(self.procedure_steps):
-                if i not in self.detected_steps_cumulative:
-                    step_detail = f"Step {s.get('step_number', i+1)}: {s['step_name']}"
-                    # Mark expected next step
-                    if i == min([idx for idx in range(len(self.procedure_steps)) if idx not in self.detected_steps_cumulative], default=len(self.procedure_steps)):
-                        step_detail += " ← EXPECTED NEXT"
-                    remaining_steps.append(step_detail)
-            remaining_context = "\n".join(remaining_steps) if remaining_steps else "All steps detected!"
-            
-            # Build list of detected step numbers
-            detected_step_numbers = [
-                self.procedure_steps[i].get('step_number', i+1) 
-                for i in sorted(self.detected_steps_cumulative)
-            ]
-            cumulative_note = f"\n**IMPORTANT:** Steps {', '.join(map(str, detected_step_numbers))} have been detected and should REMAIN detected. Focus on detecting remaining steps.\n" if detected_step_numbers else ""
-            
-            # Build full chunk history context with complete analysis
-            history_context = ""
-            if self.chunk_history:
-                # Show last 5 chunks with full analysis for better context
-                recent_history = self.chunk_history
-                history_lines = []
-                for idx, hist in enumerate(recent_history, start=len(self.chunk_history)-len(recent_history)+1):
-                    # Extract key information from analysis
-                    lines = hist.split('\n')
-                    detected_step = next((line for line in lines if 'Detected Step:' in line), 'Unknown')
-                    progress = next((line for line in lines if 'Step Progress:' in line), 'Unknown')
-                    matches = next((line for line in lines if 'Matches Expected:' in line), 'Unknown')
-                    
-                    history_lines.append(f"Chunk {idx}:")
-                    history_lines.append(f"  {detected_step}")
-                    history_lines.append(f"  {progress}")
-                    history_lines.append(f"  {matches}")
-                history_context = f"\n**Analysis History (Last {len(recent_history)} chunks):**\n" + "\n".join(history_lines) + "\n"
-            
-            # Build prompt based on procedure source
+            frames = chunk_data["frames"]
+
+            # ── Build MP4 video from captured JPEG frames ─────────────────
+            # Run blocking OpenCV I/O in a thread so the event loop stays free
+            video_bytes = await asyncio.to_thread(self._create_video_from_frames, frames)
+
+            # ── Build per-chunk prompt with previous analysis as context ──
+            history_summary = build_chunk_history_summary(self.chunk_history)
+            previous_context = self._build_previous_analysis_context()
+
             if self.procedure_source == "outlier":
-                # Use outlier resolution prompt with error detection
-                remaining_phases = [
-                    phase for i, phase in enumerate(self.outlier_procedure.get('phases', []))
-                    if i not in self.detected_steps_cumulative
-                ]
-                
                 detected_phase_numbers = {
-                    self.procedure_steps[i].get('phase_number') 
+                    self.procedure_steps[i].get("phase_number")
                     for i in self.detected_steps_cumulative
                 }
-                
-                prompt = get_outlier_chunk_analysis_prompt(
-                    outlier_procedure=self.outlier_procedure,
+                remaining_phases = [
+                    phase
+                    for i, phase in enumerate(self.outlier_procedure.get("phases", []))
+                    if i not in self.detected_steps_cumulative
+                ]
+                next_undetected = next(
+                    (i for i in range(len(self.procedure_steps)) if i not in self.detected_steps_cumulative),
+                    None,
+                )
+                current_phase = (
+                    self.outlier_procedure["phases"][next_undetected]
+                    if next_undetected is not None
+                    else None
+                )
+                prompt = build_outlier_chunk_prompt(
                     detected_phases=detected_phase_numbers,
                     remaining_phases=remaining_phases,
-                    chunk_history=self.chunk_history
+                    current_phase=current_phase,
+                    chunk_history_summary=history_summary,
+                    chunk_frame_count=len(frames),
                 )
+                schema = get_outlier_chunk_schema()
             else:
-                # Use standard prompt for master procedures
-                procedure_name = self.master_procedure.get('procedure_name') if self.master_procedure else 'Unknown Procedure'
-                
-                prompt = get_standard_chunk_analysis_prompt(
-                    procedure_name=procedure_name,
+                prompt = build_standard_chunk_prompt(
                     current_step=current_step,
-                    detected_context=detected_context,
-                    remaining_context=remaining_context,
-                    history_context=history_context,
-                    cumulative_note=cumulative_note,
-                    chunk_duration=len(chunk_data['frames'])
+                    detected_steps_cumulative=self.detected_steps_cumulative,
+                    procedure_steps=self.procedure_steps,
+                    chunk_history_summary=history_summary,
+                    chunk_frame_count=len(frames),
                 )
-            
+                schema = get_standard_chunk_schema()
+
+            # Prepend previous analysis context to the prompt
+            if previous_context:
+                prompt = previous_context + "\n\n" + prompt
+
             logger.info(
-                "chunk_prompt_built",
+                "chunk_video_built",
                 session_id=self.session_id,
-                prompt=prompt
+                frame_count=len(frames),
+                video_size_kb=len(video_bytes) // 1024,
+                prompt_length=len(prompt),
             )
 
-            # Analyze video chunk
-            analysis = await self.gemini_client.analyze_video_chunk(
-                video_data=video_data,
-                prompt=prompt
+            # ── Send MP4 video inline to Gemini ───────────────────────────
+            result = await self.gemini_client.analyze_video_chunk_inline(
+                video_bytes=video_bytes,
+                prompt=prompt,
+                response_schema=schema,
+                system_instruction=self._system_instruction,
             )
-            
-            # Store in chunk history for full context
-            self.chunk_history.append(analysis)
-            # Keep only last 10 chunks to avoid memory bloat
+
+            # Store structured result in chunk history
+            self.chunk_history.append(result)
             if len(self.chunk_history) > 10:
                 self.chunk_history = self.chunk_history[-10:]
-            
-            # Store for backward compatibility
-            self.previous_analysis = analysis
-            
+
+            self.previous_analysis = result.get("analysis_summary", "")
+
             logger.info(
                 "chunk_analyzed",
                 session_id=self.session_id,
-                current_step=current_step['step_name'],
-                frames=len(chunk_data["frames"]),
-                history_size=len(self.chunk_history)
+                current_step=current_step["step_name"],
+                frames=len(frames),
+                history_size=len(self.chunk_history),
             )
-            
-            # Parse and process response
-            await self._process_analysis_response(analysis, current_step, chunk_data)
-            
+
+            await self._process_analysis_response(result, current_step, chunk_data)
+
         except Exception as e:
             logger.error(
                 "chunk_analysis_failed",
                 session_id=self.session_id,
-                error=str(e)
+                error=str(e),
             )
     
     async def _process_analysis_response(
-        self, 
-        analysis: str, 
+        self,
+        analysis: dict,
         current_step: Dict[str, Any],
-        chunk_data: Optional[Dict[str, Any]] = None
+        chunk_data: Optional[Dict[str, Any]] = None,
     ):
-        """Process analysis response using cumulative step tracking (like reference implementation)."""
+        """Process structured dict from Gemini — no regex, direct field access."""
         try:
-            # Increment chunk counter for history tracking
+            # ── significant_change gate ──────────────────────────────────
+            # If Gemini says the scene is the same as the previous chunk,
+            # skip all heavy work (tracking, DB writes, alerts, callbacks).
+            # Always process if there's no history yet (first chunk).
+            significant_change = analysis.get("significant_change", True)
+            observation = analysis.get("observation", "")
+
+            if not significant_change and self.chunk_history:
+                logger.info(
+                    "chunk_no_significant_change_skipped",
+                    session_id=self.session_id,
+                    observation=observation,
+                    frame_count=chunk_data.get("end_frame") if chunk_data else None,
+                )
+                return
+
             if self.procedure_source == "outlier" and self.checkpoint_tracker:
                 self.checkpoint_tracker.increment_chunk_counter()
-            
-            # Parse AI response differently for outlier vs standard mode
+
+            # ── Extract fields directly from structured dict ──────────────
             if self.procedure_source == "outlier":
-                # For outlier mode: parse phase_number and checkpoint details
-                detected_phase_number = self.outlier_parser.parse_detected_phase(analysis)
-                checkpoint_status = self.outlier_parser.parse_checkpoint_status(analysis)
-                error_codes = self.outlier_parser.parse_error_codes(analysis)
-                step_progress = self.outlier_parser.parse_step_progress(analysis)
-                completion_evidence = self.outlier_parser.parse_completion_evidence(analysis)
-                
-                # Convert phase_number to index for cumulative tracking
-                detected_step_index = self.phase_number_to_index.get(detected_phase_number) if detected_phase_number else None
-                
-                # Update checkpoint tracker if we have checkpoint details
-                if detected_phase_number and checkpoint_status.get("details"):
-                    self.checkpoint_tracker.update_from_ai_checkpoint_details(
-                        detected_phase_number,
-                        checkpoint_status["details"]
-                    )
-                
-                # CRITICAL: A8 (Operation Omitted) Detection via prerequisite validation
+                detected_phase_number = analysis.get("detected_phase_number")
+                checkpoint_validations = analysis.get("checkpoint_validations", [])
+                error_codes = analysis.get("error_codes", [])
+                step_progress = analysis.get("step_progress")
+                completion_evidence = analysis.get("completion_evidence")
+                matches_expected = analysis.get("matches_expected", False)
+
+                detected_step_index = (
+                    self.phase_number_to_index.get(detected_phase_number)
+                    if detected_phase_number
+                    else None
+                )
+
+                # Update checkpoint tracker from structured validations
+                if detected_phase_number and checkpoint_validations and self.checkpoint_tracker:
+                    for cv in checkpoint_validations:
+                        cp_name = cv.get("checkpoint_name", "")
+                        req_text = cv.get("requirement", "")
+                        status = cv.get("status", "NOT_MET")
+                        evidence = cv.get("evidence", "")
+                        completed = status == "MET"
+                        phase_cp_status = self.checkpoint_tracker.get_phase_checkpoint_status(
+                            detected_phase_number
+                        )
+                        for cp in phase_cp_status.get("checkpoints", []):
+                            if cp["name"].lower() == cp_name.lower():
+                                for req in cp.get("requirements", []):
+                                    if req_text.lower() in req.get("text", "").lower():
+                                        self.checkpoint_tracker.update_checkpoint_requirement(
+                                            detected_phase_number,
+                                            cp_name,
+                                            req.get("text", req_text),
+                                            completed,
+                                            evidence,
+                                        )
+
+                # A8 detection via prerequisite validation
                 if detected_phase_number and self.checkpoint_tracker:
                     eligibility = self.checkpoint_tracker.is_phase_eligible(detected_phase_number)
-                    
                     if not eligibility["eligible"]:
-                        # Phase detected but prerequisites not satisfied = A8 error
                         for prereq in eligibility["blocking_prerequisites"]:
                             a8_error = {
                                 "code": "A8",
-                                "description": f"Phase {detected_phase_number} started before Phase {prereq['phase']} prerequisites satisfied",
+                                "description": (
+                                    f"Phase {detected_phase_number} started before "
+                                    f"Phase {prereq['phase']} prerequisites satisfied"
+                                ),
                                 "severity": "HIGH",
-                                "blocking_checkpoints": prereq["blocking_checkpoints"]
+                                "blocking_checkpoints": prereq["blocking_checkpoints"],
                             }
                             error_codes.append(a8_error)
-                            
                             logger.error(
                                 "a8_operation_omitted_detected",
                                 session_id=self.session_id,
                                 current_phase=detected_phase_number,
-                                prerequisite_phase=prereq['phase'],
-                                missing_checkpoints=prereq["blocking_checkpoints"],
-                                evidence="Backend prerequisite validation"
+                                prerequisite_phase=prereq["phase"],
                             )
-                
+
+                checkpoint_status = {"details": checkpoint_validations} if checkpoint_validations else None
+
                 logger.info(
                     "outlier_analysis_parsed",
                     session_id=self.session_id,
                     detected_phase=detected_phase_number,
-                    checkpoint_status=checkpoint_status.get("status"),
                     error_count=len(error_codes),
-                    step_progress=step_progress
+                    step_progress=step_progress,
                 )
             else:
-                # For standard mode: parse step index as before
-                detected_step_index = self._parse_detected_step(analysis)
+                detected_step_number = analysis.get("detected_step_number")
+                detected_step_index = (detected_step_number - 1) if detected_step_number else None
+                if detected_step_index is not None and (
+                    detected_step_index < 0 or detected_step_index >= len(self.procedure_steps)
+                ):
+                    detected_step_index = None
+                matches_expected = analysis.get("matches_expected", False)
+                step_progress = analysis.get("step_progress")
+                completion_evidence = analysis.get("completion_evidence")
                 checkpoint_status = None
                 error_codes = []
-                step_progress = self._parse_step_progress(analysis)
-                completion_evidence = self._parse_completion_evidence(analysis)
-            
-            matches_expected = "yes" in analysis.lower() and "matches expected: yes" in analysis.lower()
-            
-            # Log current state before processing
+
+            confidence_score = analysis.get("confidence_score", 0)
+            confidence_reason = analysis.get("confidence_reason", "")
+
             logger.info(
                 "analysis_parsed",
                 session_id=self.session_id,
                 detected_step=detected_step_index,
+                confidence_score=confidence_score,
+                confidence_reason=confidence_reason,
                 matches_expected=matches_expected,
                 step_progress=step_progress,
                 has_completion_evidence=bool(completion_evidence),
-                detected_steps_cumulative=list(self.detected_steps_cumulative)
+                detected_steps_cumulative=list(self.detected_steps_cumulative),
             )
-            
-            # CUMULATIVE TRACKING: Add detected step to cumulative set (NEVER removed)
-            if detected_step_index is not None and matches_expected:
-                # Check if this is a new detection
+
+            # ── Cumulative tracking ─────────────────────────────
+            # Only track steps/phases Gemini detects with >= CONFIDENCE_THRESHOLD.
+            # Low-confidence matches are logged but skipped to avoid false positives.
+            if detected_step_index is not None and confidence_score >= CONFIDENCE_THRESHOLD:
                 is_new_detection = detected_step_index not in self.detected_steps_cumulative
-                
-                # Add to cumulative set (once added, never removed)
                 self.detected_steps_cumulative.add(detected_step_index)
-                
-                # Store detection in history
+
                 if detected_step_index not in self.step_detection_history:
                     self.step_detection_history[detected_step_index] = []
                 self.step_detection_history[detected_step_index].append(analysis)
-                # Keep only last 3 detections per step
                 if len(self.step_detection_history[detected_step_index]) > 3:
-                    self.step_detection_history[detected_step_index] = self.step_detection_history[detected_step_index][-3:]
-                
-                # Update status to detected
+                    self.step_detection_history[detected_step_index] = (
+                        self.step_detection_history[detected_step_index][-3:]
+                    )
+
                 self.step_status[detected_step_index] = "detected"
-                
+
+                # Advance current_step_index to next undetected so the next
+                # chunk prompt shows the correct "expected next" hint
+                self.current_step_index = next(
+                    (i for i in range(len(self.procedure_steps)) if i not in self.detected_steps_cumulative),
+                    len(self.procedure_steps) - 1,
+                )
+
                 if is_new_detection:
                     logger.info(
                         "step_detected_cumulative",
                         session_id=self.session_id,
                         step_index=detected_step_index,
-                        step_name=self.procedure_steps[detected_step_index]['step_name'],
-                        total_detected=len(self.detected_steps_cumulative)
+                        step_name=self.procedure_steps[detected_step_index]["step_name"],
+                        total_detected=len(self.detected_steps_cumulative),
+                        current_step_index_now=self.current_step_index,
                     )
-                else:
-                    logger.debug(
-                        "step_seen_again",
-                        session_id=self.session_id,
-                        step_index=detected_step_index,
-                        step_name=self.procedure_steps[detected_step_index]['step_name']
-                    )
-                
-                # Check for skipped steps (steps that should have been detected but weren't)
-                undetected_before = [i for i in range(detected_step_index) if i not in self.detected_steps_cumulative]
-                
-                # Mark significantly skipped steps as missed (more than 2 steps behind)
-                for i in undetected_before:
-                    if detected_step_index - i > 2 and self.step_status.get(i) == "pending":
-                        self.step_status[i] = "missed"
-                        logger.warning(
-                            "step_marked_missed",
-                            session_id=self.session_id,
-                            step_index=i,
-                            step_name=self.procedure_steps[i]['step_name'],
-                            reason=f"Step {detected_step_index} detected, but step {i} not seen"
-                        )
-                        await self._create_missed_step_alert(i)
-            
-            # Send real-time update to frontend
+
+                # Mark significantly skipped steps as missed
+                for i in range(detected_step_index):
+                    if i not in self.detected_steps_cumulative:
+                        if detected_step_index - i > 2 and self.step_status.get(i) == "pending":
+                            self.step_status[i] = "missed"
+                            logger.warning(
+                                "step_marked_missed",
+                                session_id=self.session_id,
+                                step_index=i,
+                                step_name=self.procedure_steps[i]["step_name"],
+                            )
+                            await self._generate_missed_step_alert(i)
+
+            # ── Build analysis text from structured result ─────────────────
+            analysis_text = analysis.get("analysis_summary", "")
+            if analysis.get("action_observed"):
+                analysis_text = f"{analysis['action_observed']}\n\n{analysis_text}"
+
+            # ── Send real-time update to frontend ─────────────────────────
             if self.analysis_callback:
                 try:
-                    frame_info = chunk_data if chunk_data else {"start_frame": self.frame_count, "end_frame": self.frame_count}
-                    
-                    # Calculate current step as the next undetected step (for frontend progress display)
+                    frame_info = chunk_data if chunk_data else {
+                        "start_frame": self.frame_count,
+                        "end_frame": self.frame_count,
+                    }
                     next_undetected_index = next(
                         (i for i in range(len(self.procedure_steps)) if i not in self.detected_steps_cumulative),
-                        len(self.procedure_steps) - 1  # Default to last step if all detected
+                        len(self.procedure_steps) - 1,
                     )
                     current_step_for_display = self.procedure_steps[next_undetected_index]
-                    
-                    # Build all_steps with checkpoint information for outlier mode
+
                     all_steps_data = []
-                    
-                    logger.info(
-                        "building_analysis_callback_data",
-                        session_id=self.session_id,
-                        procedure_source=self.procedure_source,
-                        total_steps=len(self.procedure_steps),
-                        detected_cumulative=list(self.detected_steps_cumulative)
-                    )
-                    
                     for i, s in enumerate(self.procedure_steps):
                         step_data = {
-                            "step_number": s.get('step_number', i+1),
-                            "step_name": s['step_name'],
-                            "description": s.get('description'),
-                            "is_critical": s.get('is_critical', False),
-                            "detected": i in self.detected_steps_cumulative
+                            "step_number": s.get("step_number", i + 1),
+                            "step_name": s["step_name"],
+                            "description": s.get("description"),
+                            "is_critical": s.get("is_critical", False),
+                            "detected": i in self.detected_steps_cumulative,
                         }
-                        
-                        # For outlier mode, add checkpoint and phase-specific data
+
                         if self.procedure_source == "outlier":
-                            phase_number = s.get('phase_number')
-                            phase = self.outlier_procedure['phases'][i] if i < len(self.outlier_procedure.get('phases', [])) else {}
-                            
-                            logger.debug(
-                                "building_phase_data",
-                                session_id=self.session_id,
-                                phase_index=i,
-                                phase_number=phase_number,
-                                phase_name=phase.get('phase_name'),
-                                has_phase_data=bool(phase)
+                            phase_number = s.get("phase_number")
+                            phase = (
+                                self.outlier_procedure["phases"][i]
+                                if i < len(self.outlier_procedure.get("phases", []))
+                                else {}
                             )
-                            
-                            # Get checkpoint status for this phase
-                            checkpoint_info = self.checkpoint_tracker.get_phase_checkpoint_status(phase_number) if self.checkpoint_tracker else {}
-                            
-                            logger.debug(
-                                "checkpoint_info_retrieved",
-                                session_id=self.session_id,
-                                phase_number=phase_number,
-                                has_checkpoints=checkpoint_info.get('has_checkpoints'),
-                                all_complete=checkpoint_info.get('all_complete'),
-                                checkpoint_count=len(checkpoint_info.get('checkpoints', []))
+                            checkpoint_info = (
+                                self.checkpoint_tracker.get_phase_checkpoint_status(phase_number)
+                                if self.checkpoint_tracker
+                                else {}
                             )
-                            
-                            # Determine phase status based on checkpoints
                             if i in self.detected_steps_cumulative:
-                                # Phase is detected, check if checkpoints are complete
-                                if checkpoint_info.get('has_checkpoints'):
-                                    if checkpoint_info.get('all_complete'):
+                                if checkpoint_info.get("has_checkpoints"):
+                                    if checkpoint_info.get("all_complete"):
                                         phase_status = "completed"
                                     else:
-                                        # Check if there are blocking checkpoints
-                                        blocking_checkpoints = self.checkpoint_tracker.get_blocking_checkpoints(phase_number) if self.checkpoint_tracker else []
-                                        phase_status = "blocked" if blocking_checkpoints else "current"
+                                        blocking = (
+                                            self.checkpoint_tracker.get_blocking_checkpoints(phase_number)
+                                            if self.checkpoint_tracker
+                                            else []
+                                        )
+                                        phase_status = "blocked" if blocking else "current"
                                 else:
-                                    # No checkpoints, phase is completed when detected
                                     phase_status = "completed"
                             else:
                                 phase_status = self.step_status.get(i, "pending")
-                            
+
                             step_data.update({
                                 "phase_number": phase_number,
-                                "phase_name": phase.get('phase_name'),  # Add phase_name explicitly
-                                "goal": phase.get('goal'),
-                                "priority": phase.get('priority'),
+                                "phase_name": phase.get("phase_name"),
+                                "goal": phase.get("goal"),
+                                "priority": phase.get("priority"),
                                 "status": phase_status,
-                                "checkpoints": checkpoint_info.get('checkpoints', []),
-                                "detected_errors": error_codes if i == detected_step_index else []
+                                "checkpoints": checkpoint_info.get("checkpoints", []),
+                                "detected_errors": error_codes if i == detected_step_index else [],
                             })
-                            
-                            logger.info(
-                                "phase_data_built",
-                                session_id=self.session_id,
-                                phase_index=i,
-                                phase_number=phase_number,
-                                phase_name=step_data.get('phase_name'),
-                                status=phase_status,
-                                checkpoint_count=len(step_data.get('checkpoints', []))
-                            )
                         else:
-                            # Standard mode status
                             step_data["status"] = (
-                                "completed" if i in self.detected_steps_cumulative
+                                "completed"
+                                if i in self.detected_steps_cumulative
                                 else self.step_status.get(i, "pending")
                             )
-                        
+
                         all_steps_data.append(step_data)
-                    
-                    logger.info(
-                        "all_steps_data_complete",
-                        session_id=self.session_id,
-                        total_phases=len(all_steps_data),
-                        sample_phase=all_steps_data[0] if all_steps_data else None
-                    )
-                    
+
                     analysis_data = {
                         "frame_count": frame_info["end_frame"],
                         "current_step_index": next_undetected_index,
-                        "current_step_name": current_step_for_display['step_name'],
+                        "current_step_name": current_step_for_display["step_name"],
                         "detected_step_index": detected_step_index,
                         "matches_expected": matches_expected,
                         "procedure_source": self.procedure_source,
                         "expected_step": {
-                            "step_number": current_step_for_display.get('step_number'),
-                            "step_name": current_step_for_display['step_name'],
-                            "description": current_step_for_display.get('description'),
-                            "is_critical": current_step_for_display.get('is_critical', False)
+                            "step_number": current_step_for_display.get("step_number"),
+                            "step_name": current_step_for_display["step_name"],
+                            "description": current_step_for_display.get("description"),
+                            "is_critical": current_step_for_display.get("is_critical", False),
                         },
                         "all_steps": all_steps_data,
-                        "analysis_text": analysis,
-                        "timestamp": datetime.utcnow().isoformat()
+                        "analysis_text": analysis_text,
+                        "timestamp": datetime.utcnow().isoformat(),
                     }
-                    
-                    # Add outlier-specific data
+
                     if self.procedure_source == "outlier" and checkpoint_status:
                         analysis_data["checkpoint_status"] = checkpoint_status
-                    
+
                     await self.analysis_callback(analysis_data)
                 except Exception as callback_error:
-                    # WebSocket may be closed - log but don't fail processing
                     logger.warning(
                         "analysis_callback_failed",
                         session_id=self.session_id,
                         error=str(callback_error),
-                        error_type=type(callback_error).__name__
+                        error_type=type(callback_error).__name__,
                     )
-            
-            # Check compliance (don't fail if this errors either)
+
+            # ── Compliance check ──────────────────────────────────────────
             try:
-                await self._check_compliance(analysis, current_step)
+                await self._check_compliance(analysis_text, current_step)
             except Exception as compliance_error:
                 logger.warning(
                     "compliance_check_failed",
                     session_id=self.session_id,
-                    error=str(compliance_error)
+                    error=str(compliance_error),
                 )
-            
+
         except Exception as e:
             logger.error(
                 "analysis_response_processing_failed",
                 session_id=self.session_id,
-                error=str(e)
-            )
-    
-    async def _analyze_current_state(self):
-        """
-        Analyze current surgical state using the latest frame.
-        """
-        if not self.frame_buffer or not self.procedure_steps:
-            return
-        
-        try:
-            # Get current expected step
-            if self.current_step_index >= len(self.procedure_steps):
-                logger.info(
-                    "procedure_completed",
-                    session_id=self.session_id,
-                    total_steps=len(self.procedure_steps)
-                )
-                return
-            
-            current_step = self.procedure_steps[self.current_step_index]
-            
-            # Build completed steps context with details
-            completed_steps = [
-                f"Step {s.get('step_number', i+1)}: {s['step_name']} - COMPLETED ✓\n  Description: {s.get('description', 'N/A')[:100]}..."
-                for i, s in enumerate(self.procedure_steps)
-                if self.step_status.get(i) == "completed"
-            ]
-            completed_context = "\n".join(completed_steps) if completed_steps else "None yet"
-            
-            # Build remaining steps context with full details (current and pending only)
-            remaining_steps = []
-            for i, s in enumerate(self.procedure_steps):
-                if self.step_status.get(i) in ["current", "pending"]:
-                    step_detail = f"Step {s.get('step_number', i+1)}: {s['step_name']}"
-                    if i == self.current_step_index:
-                        step_detail += " (EXPECTED NOW)"
-                    step_detail += f"\n  Description: {s.get('description', 'N/A')}"
-                    step_detail += f"\n  Instruments: {', '.join(s.get('instruments_required', []))}"
-                    step_detail += f"\n  Landmarks: {', '.join(s.get('anatomical_landmarks', []))}"
-                    remaining_steps.append(step_detail)
-            remaining_context = "\n\n".join(remaining_steps)
-            
-            # Build previous frame context for temporal awareness
-            previous_frame_context = ""
-            if self.previous_analysis:
-                previous_frame_context = f"""
-
-**PREVIOUS FRAME ANALYSIS (for context awareness):**
-{self.previous_analysis}
-
-**IMPORTANT:** Use the previous frame analysis to understand:
-- What was happening in the last frame
-- Continuity of surgical actions
-- Whether the same action is continuing or a new action has started
-- Temporal progression of the procedure
-"""
-            
-            # Prepare detailed analysis prompt with completed steps awareness
-            # IMPORTANT: This matches the strict Live API format for consistency
-            procedure_name = (
-                self.outlier_procedure.get('procedure_name') if self.procedure_source == "outlier"
-                else self.master_procedure.get('procedure_name')
-            )
-            
-            prompt = f"""
-You are monitoring a live surgical procedure: {procedure_name}
-
-**COMPLETED STEPS (DO NOT MATCH AGAINST THESE):**
-{completed_context}
-
-**REMAINING STEPS TO PERFORM:**
-{remaining_context}
-
-**EXPECTED CURRENT STEP (Step {current_step.get('step_number', self.current_step_index + 1)}):**
-- Name: {current_step['step_name']}
-- Description: {current_step.get('description', 'N/A')}
-- Critical: {current_step.get('is_critical', False)}
-- Expected Instruments: {', '.join(current_step.get('instruments_required', []))}
-- Anatomical Landmarks: {', '.join(current_step.get('anatomical_landmarks', []))}
-{previous_frame_context}
-**CRITICAL: UNDERSTANDING STEP COMPLETION**
-
-⚠️ SURGICAL STEPS TAKE TIME - DO NOT RUSH TO COMPLETION ⚠️
-
-A surgical step is NOT complete just because you see instruments or landmarks that match the step description.
-
-**WHAT DOES NOT MEAN A STEP IS COMPLETE:**
-❌ Seeing instruments mentioned in the step
-❌ Seeing anatomical landmarks mentioned in the step  
-❌ Frame "looks similar" to what the step describes
-❌ Surgeon is "working on" the area mentioned in the step
-❌ Some action from the step is visible
-
-**WHAT MEANS A STEP IS COMPLETE:**
-✅ You observe the ENTIRE action sequence being performed
-✅ You see clear COMPLETION markers (e.g., suture tied, organ removed, port secured)
-✅ Surgeon moves to NEXT anatomical area or changes instruments for next step
-✅ The surgical field shows EVIDENCE of completion (e.g., hemostasis achieved, dissection finished)
-
-**YOUR TASK:**
-1. **OBSERVE, DON'T ASSUME**: Watch what is actually happening, not what might be happening
-2. **VERIFY ACTIONS**: Confirm the surgeon is performing the specific action described in the step
-3. **WAIT FOR COMPLETION**: Do not mark complete until you see clear completion evidence
-4. **BE CONSERVATIVE**: When in doubt, keep the step as "in-progress", do NOT mark complete
-
-**RESPONSE FORMAT (REQUIRED):**
-
-Detected Step: [number] - [name]
-Action Being Performed: [specific action you observe - be detailed]
-Instruments Visible: [list what you actually see]
-Anatomical Landmarks: [list what you actually see]
-Matches Expected: [yes/no - does current frame match expected step?]
-Step Progress: [just-started / in-progress / nearing-completion / completed]
-Completion Evidence: [REQUIRED if marking completed - what proves it's done? If not complete, write "N/A"]
-Sequence Status: [in-sequence/out-of-sequence/skipped-step]
-Repeated Completed Step: [yes/no]
-Analysis: [detailed observation - what is the surgeon doing RIGHT NOW?]
-
-**STRICT COMPLETION RULES:**
-
-1. **DO NOT mark "Matches Expected: yes" unless:**
-   - Current frame shows the expected step being actively performed
-   - You can describe the specific action happening
-   - The action matches the step description
-
-2. **DO NOT mark Step Progress as "completed" unless:**
-   - You observe clear completion evidence (describe it explicitly in Completion Evidence field)
-   - The surgical field changes indicating progression to next step
-
-3. **DO NOT match similarity - VERIFY ACTIONS:**
-   - Bad: "I see a grasper, so this must be Step 3"
-   - Good: "I see the surgeon using a grasper to dissect Calot's triangle, actively separating the cystic duct from surrounding tissue - Step 3 is being performed"
-
-4. **BE EXTREMELY CONSERVATIVE:**
-   - If unsure whether step is complete → mark "in-progress", NOT "completed"
-   - If you see partial progress → mark "in-progress"
-   - If instruments are present but no clear action → mark "just-started" or "in-progress"
-   - Only mark "completed" when you have clear evidence in the Completion Evidence field
-
-**ANTI-HALLUCINATION RULES:**
-1. Only report what you ACTUALLY SEE in the current frame
-2. Do not infer completion from instrument presence alone
-3. Do not assume steps are done quickly - surgery is slow and methodical
-4. If the view is unclear or obstructed, say so in Analysis - do not guess
-5. ONLY compare against REMAINING STEPS, not completed ones
-"""
-            
-            # Analyze latest frame
-            latest_frame = self.frame_buffer[-1]
-            analysis = await self.gemini_client.analyze_frame(
-                frame_data=latest_frame,
-                prompt=prompt
-            )
-            
-            # Store this analysis for next frame's context awareness
-            self.previous_analysis = analysis
-            
-            logger.info(
-                "frame_analyzed",
-                session_id=self.session_id,
-                current_step=current_step['step_name'],
-                frame_count=self.frame_count
-            )
-            
-            # Parse AI response with new strict format
-            detected_step_index = self._parse_detected_step(analysis)
-            matches_expected = "yes" in analysis.lower() and "matches expected: yes" in analysis.lower()
-            is_repeated_step = "repeated completed step: yes" in analysis.lower()
-            
-            # Parse step progress and completion evidence (new fields)
-            step_progress = self._parse_step_progress(analysis)
-            completion_evidence = self._parse_completion_evidence(analysis)
-            
-            logger.info(
-                "per_frame_analysis_parsed",
-                session_id=self.session_id,
-                detected_step=detected_step_index,
-                step_progress=step_progress,
-                has_completion_evidence=bool(completion_evidence),
-                matches_expected=matches_expected
-            )
-            
-            # CRITICAL: Prevent completed steps from reverting to current
-            # Only allow going back to completed step if AI is VERY confident it's being repeated
-            if detected_step_index is not None:
-                detected_step_status = self.step_status.get(detected_step_index)
-                
-                # If detected step is already completed, only accept if AI confirms repetition
-                if detected_step_status == "completed" and not is_repeated_step:
-                    logger.info(
-                        "ignoring_completed_step_detection",
-                        session_id=self.session_id,
-                        detected_step=detected_step_index,
-                        current_step=self.current_step_index,
-                        reason="Step already completed and no strong evidence of repetition"
-                    )
-                    # Treat as if still on current step
-                    detected_step_index = self.current_step_index
-            
-            # Update step status based on detection with stricter completion logic
-            if detected_step_index is not None and detected_step_index != self.current_step_index:
-                # Check if this is a valid transition
-                detected_status = self.step_status.get(detected_step_index)
-                
-                if detected_status == "completed" and is_repeated_step:
-                    # Very rare case: surgeon is repeating a completed step
-                    logger.warning(
-                        "step_repetition_detected",
-                        session_id=self.session_id,
-                        step_index=detected_step_index,
-                        step_name=self.procedure_steps[detected_step_index]['step_name']
-                    )
-                    # Mark current step as pending and go back to repeated step
-                    self.step_status[self.current_step_index] = "pending"
-                    self.current_step_index = detected_step_index
-                    self.step_status[detected_step_index] = "current"
-                    
-                elif detected_step_index > self.current_step_index:
-                    # Surgeon jumped ahead - mark skipped steps as missed
-                    for i in range(self.current_step_index, detected_step_index):
-                        if self.step_status.get(i) != "completed":
-                            self.step_status[i] = "missed"
-                            await self._generate_missed_step_alert(i)
-                    
-                    # Update to detected step
-                    self.current_step_index = detected_step_index
-                    self.step_status[detected_step_index] = "current"
-                    
-            elif matches_expected and detected_step_index == self.current_step_index:
-                # STRICTER COMPLETION LOGIC: Only mark complete if step_progress is "completed" AND completion_evidence exists
-                if step_progress == "completed" and completion_evidence:
-                    logger.info(
-                        "step_completed_with_evidence",
-                        session_id=self.session_id,
-                        step_index=self.current_step_index,
-                        evidence=completion_evidence
-                    )
-                    self.step_status[self.current_step_index] = "completed"
-                    self.current_step_index += 1
-                    if self.current_step_index < len(self.procedure_steps):
-                        self.step_status[self.current_step_index] = "current"
-                else:
-                    # Step is being performed but not complete yet
-                    logger.debug(
-                        "step_in_progress_per_frame",
-                        session_id=self.session_id,
-                        step_index=self.current_step_index,
-                        progress=step_progress,
-                        has_evidence=bool(completion_evidence)
-                    )
-            
-            # Send real-time analysis update to frontend with all step statuses
-            if self.analysis_callback:
-                analysis_data = {
-                    "frame_count": self.frame_count,
-                    "current_step_index": self.current_step_index,
-                    "current_step_name": current_step['step_name'],
-                    "detected_step_index": detected_step_index,
-                    "matches_expected": matches_expected,
-                    "expected_step": {
-                        "step_number": current_step.get('step_number'),
-                        "step_name": current_step['step_name'],
-                        "description": current_step.get('description'),
-                        "is_critical": current_step.get('is_critical', False)
-                    },
-                    "all_steps": [
-                        {
-                            "step_number": s.get('step_number', i+1),
-                            "step_name": s['step_name'],
-                            "description": s.get('description'),
-                            "is_critical": s.get('is_critical', False),
-                            "status": self.step_status.get(i, "pending")
-                        }
-                        for i, s in enumerate(self.procedure_steps)
-                    ],
-                    "analysis_text": analysis,
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-                await self.analysis_callback(analysis_data)
-            
-            # Check for deviations and generate alerts
-            await self._check_compliance(analysis, current_step)
-            
-        except Exception as e:
-            logger.error(
-                "state_analysis_failed",
-                session_id=self.session_id,
-                error=str(e)
+                error=str(e),
             )
     
     async def _check_compliance(
@@ -1119,93 +922,6 @@ Analysis: [detailed observation - what is the surgeon doing RIGHT NOW?]
                 session_id=self.session_id,
                 error=str(e)
             )
-    
-    def _parse_detected_phase_number(self, analysis: str) -> Optional[str]:
-        """
-        Parse the detected phase number from AI analysis response (for outlier mode).
-        
-        Args:
-            analysis: AI analysis text
-            
-        Returns:
-            Phase number (e.g., "3.4") or None if not detected
-        """
-        try:
-            import re
-            # Look for "Detected Phase: [phase_number]" pattern
-            match = re.search(r'Detected Phase:\s*(\d+\.\d+)', analysis, re.IGNORECASE)
-            if match:
-                return match.group(1)
-            return None
-        except Exception as e:
-            logger.error("failed_to_parse_detected_phase", error=str(e))
-            return None
-    
-    def _parse_detected_step(self, analysis: str) -> Optional[int]:
-        """
-        Parse the detected step number from AI analysis response.
-        
-        Args:
-            analysis: AI analysis text
-            
-        Returns:
-            Step index (0-based) or None if not detected
-        """
-        try:
-            # Look for "Detected Step: [number]" pattern
-            import re
-            match = re.search(r'Detected Step:\s*(\d+)', analysis, re.IGNORECASE)
-            if match:
-                step_number = int(match.group(1))
-                # Convert to 0-based index
-                return step_number - 1
-            return None
-        except Exception as e:
-            logger.error("failed_to_parse_detected_step", error=str(e))
-            return None
-    
-    def _parse_step_progress(self, analysis: str) -> Optional[str]:
-        """
-        Parse the step progress from AI analysis response.
-        
-        Args:
-            analysis: AI analysis text
-            
-        Returns:
-            Step progress status or None
-        """
-        try:
-            import re
-            match = re.search(r'Step Progress:\s*(just-started|in-progress|nearing-completion|completed)', analysis, re.IGNORECASE)
-            if match:
-                return match.group(1).lower()
-            return None
-        except Exception as e:
-            logger.error("failed_to_parse_step_progress", error=str(e))
-            return None
-    
-    def _parse_completion_evidence(self, analysis: str) -> Optional[str]:
-        """
-        Parse the completion evidence from AI analysis response.
-        
-        Args:
-            analysis: AI analysis text
-            
-        Returns:
-            Completion evidence text or None
-        """
-        try:
-            import re
-            match = re.search(r'Completion Evidence:\s*(.+?)(?:\n|$)', analysis, re.IGNORECASE)
-            if match:
-                evidence = match.group(1).strip()
-                # Only return if it's not empty or placeholder text
-                if evidence and evidence.lower() not in ['none', 'n/a', '-', 'null']:
-                    return evidence
-            return None
-        except Exception as e:
-            logger.error("failed_to_parse_completion_evidence", error=str(e))
-            return None
     
     async def _generate_missed_step_alert(self, step_index: int):
         """

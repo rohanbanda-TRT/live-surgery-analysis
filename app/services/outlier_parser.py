@@ -121,9 +121,16 @@ Extract ALL information into this exact JSON structure:
       ],
       "checkpoints": [
         {{
-          "name": "string - Checkpoint name",
-          "requirements": ["array of requirements"],
+          "name": "string - Checkpoint name (e.g. 'Before Incision', 'Before Canal Entry')",
+          "requirements": ["array of binary pass/fail requirements that must be physically verified"],
           "blocking": boolean
+        }}
+      ],
+      "alert_questions": [
+        {{
+          "question": "string - The yes/no question asked to surgeon at this decision point (e.g. 'Is the cannula positioning compatible with the defined target?', 'Are there signs of bleeding?')",
+          "expected_answer": "YES",
+          "blocking": true
         }}
       ],
       "dependencies": ["array of phase numbers that must be completed first"],
@@ -175,6 +182,10 @@ Extract ALL information into this exact JSON structure:
 8. **Extract sub-tasks** - Break down each phase into specific tasks
 9. **Capture consequences** - What happens when errors occur
 10. **Maintain accuracy** - Don't invent information, extract only what's in the document
+11. **DISTINGUISH checkpoints from alert_questions:**
+    - **checkpoints** = "STOP Points" / "Before X" gates — binary pass/fail requirements that must be physically verified before proceeding (e.g., "Correct imaging available and verified", "Recess vessels coagulated")
+    - **alert_questions** = AR-triggered yes/no questions asked to the surgeon at decision points to verify safety (e.g., "Is the cannula positioning compatible with the defined target?", "Was the medial border of SAP resected?", "Are there signs of bleeding?")
+    - Do NOT put alert questions inside checkpoints. They are separate fields.
 
 **IMPORTANT:**
 - Use exact error codes from document (A3, A8, C1, etc.)

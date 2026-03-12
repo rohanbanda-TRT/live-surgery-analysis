@@ -198,12 +198,14 @@ class ChunkedVideoComparisonService:
     original RecordedVideoComparisonService for backward compatibility.
     """
 
-    def __init__(self, db: AsyncDatabase, procedure_cache: Optional[ProcedureCache] = None):
+    def __init__(self, db: AsyncDatabase, procedure_cache: Optional[ProcedureCache] = None, gemini_model: Optional[str] = None):
         self.db = db
         self.gemini_client = GeminiClient()
+        if gemini_model:
+            self.gemini_client.model = gemini_model
         self.procedure_cache = procedure_cache or ProcedureCache()
         # Reuse the original service for short videos and for result processing
-        self._original_service = RecordedVideoComparisonService(db, self.procedure_cache)
+        self._original_service = RecordedVideoComparisonService(db, self.procedure_cache, gemini_model)
 
     async def compare_video(
         self,

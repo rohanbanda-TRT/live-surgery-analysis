@@ -203,8 +203,8 @@ function LiveMonitoringPage() {
       addMessage('info', 'Starting video stream...');
       
       const videoConstraints = selectedCameraId
-        ? { deviceId: { exact: selectedCameraId }, width: 640, height: 480 }
-        : { width: 640, height: 480 };
+        ? { deviceId: { exact: selectedCameraId }, width: 320, height: 240 }
+        : { width: 320, height: 240 };
 
       // Get user media (camera)
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -246,7 +246,7 @@ function LiveMonitoringPage() {
           if (blob) {
             wsRef.current.sendFrame(blob);
           }
-        }, 'image/jpeg', 0.8);
+        }, 'image/jpeg', 0.9);
       }
     }, 1000); // Send frame every second
   };

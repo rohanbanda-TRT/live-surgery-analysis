@@ -115,6 +115,10 @@ OUTPUT: You will respond with structured JSON matching the provided schema.
 # Dynamic prompts (per-chunk — minimal, only changing state)
 # ──────────────────────────────────────────────
 
+# Confidence threshold — steps below this score are not tracked
+CONFIDENCE_THRESHOLD = 70
+
+
 def build_standard_chunk_prompt(
     current_step: Dict[str, Any],
     detected_steps_cumulative: Set[int],
@@ -124,51 +128,48 @@ def build_standard_chunk_prompt(
 ) -> str:
     """
     Build the per-chunk dynamic prompt for standard mode.
-    Much shorter than v1 — procedure context is in system_instruction.
+    Lists ALL steps for confidence-based matching (no sequence assumption).
     """
-    # Detected steps summary
-    detected_list = []
-    for i in sorted(detected_steps_cumulative):
-        s = procedure_steps[i]
-        detected_list.append(f"✓ Step {s.get('step_number', i+1)}: {s['step_name']}")
-    detected_text = "\n".join(detected_list) if detected_list else "None yet"
-
-    # Remaining steps
-    remaining_list = []
+    # All steps table (detected marked)
+    all_steps_text = ""
     for i, s in enumerate(procedure_steps):
-        if i not in detected_steps_cumulative:
-            marker = " ← EXPECTED NEXT" if s == current_step else ""
-            remaining_list.append(
-                f"Step {s.get('step_number', i+1)}: {s['step_name']}{marker}"
-            )
-    remaining_text = "\n".join(remaining_list) if remaining_list else "All steps detected!"
+        num = s.get('step_number', i + 1)
+        name = s['step_name']
+        desc = s.get('description', '') or s.get('goal', '')
+        status = " [ALREADY DETECTED]" if i in detected_steps_cumulative else ""
+        desc_part = f" — {desc[:80]}" if desc else ""
+        all_steps_text += f"\n  Step {num}: {name}{desc_part}{status}"
 
-    # Current step info
-    step_num = current_step.get("step_number", "?")
-    step_name = current_step.get("step_name", "Unknown")
+    prompt = f"""Analyze this video chunk from the live surgery.
 
-    prompt = f"""Analyze these {chunk_frame_count} sequential frames from the live surgery.
+ALL PROCEDURE STEPS ({len(procedure_steps)} total):{all_steps_text}
 
-CURRENT STATE:
-- Suggested next step (hint only): Step {step_num} — {step_name}
-- Already detected: {len(detected_steps_cumulative)}/{len(procedure_steps)} steps
-
-DETECTED STEPS (cumulative):
-{detected_text}
-
-REMAINING STEPS:
-{remaining_text}
+ALREADY DETECTED: {len(detected_steps_cumulative)}/{len(procedure_steps)} steps
 """
     if chunk_history_summary:
-        prompt += f"\nRECENT HISTORY:\n{chunk_history_summary}\n"
+        prompt += f"\nRECENT CHUNK HISTORY:\n{chunk_history_summary}\n"
 
     prompt += """
-Fill the JSON schema based on what you observe in the frames:
-- detected_step_number: 1-based step number you can visually identify. null if frames are unclear, camera is away, or nothing surgical is happening.
-- matches_expected: true only if the observed step matches the suggested next step above.
-- step_progress: use "in-progress" unless you see clear completion evidence. "completed" requires definitive visual proof.
-- completion_evidence: specific visual proof of completion. null if step is not completed.
-- action_observed: describe what is ACTUALLY visible — including "camera pointed away", "nothing visible", "surgeon repositioning" etc.
+YOUR TASK:
+1. Compare the video against ALL steps above and find the ONE step most clearly being performed.
+2. Assign a confidence_score (0-100) for how certain the match is:
+   - 90-100: unmistakable visual evidence (specific instruments, anatomy, exact action)
+   - 70-89: strong visual match (clear activity consistent with the step)
+   - 50-69: ambiguous — some similarity but not conclusive
+   - 0-49: no clear surgical activity, camera away, or cannot determine
+3. If confidence_score < 70, set detected_step_number to null — do not guess.
+4. confidence_reason: briefly explain what specific visual evidence led to your confidence score.
+
+Fill the JSON schema:
+- observation: one factual sentence describing the current surgical field.
+- significant_change: true if scene is meaningfully different from previous chunk context. false if same.
+- detected_step_number: 1-based step number with >= 70 confidence. null if uncertain.
+- matches_expected: ignore sequence — set true only if step is a clear unambiguous match regardless of order.
+- confidence_score: 0-100 integer.
+- confidence_reason: brief visual evidence explanation.
+- step_progress: "in-progress" unless you see definitive completion evidence.
+- completion_evidence: specific visual proof if completed. null otherwise.
+- action_observed: exactly what is visible — instruments, anatomy, surgeon action.
 """
     return prompt
 
@@ -182,38 +183,63 @@ def build_outlier_chunk_prompt(
 ) -> str:
     """
     Build the per-chunk dynamic prompt for outlier mode.
+    Lists ALL phases with checkpoints for confidence-based matching.
     """
-    detected_text = ", ".join(sorted(detected_phases)) if detected_phases else "None yet"
-
-    remaining_text = ""
+    # Build full phase list with checkpoints
+    all_phases_text = ""
     for phase in remaining_phases:
-        pn = phase.get("phase_number", "?")
-        remaining_text += f"\n  Phase {pn}: {phase.get('phase_name', '?')}"
+        pn = phase.get('phase_number', '?')
+        pname = phase.get('phase_name', '?')
+        desc = phase.get('description', '') or phase.get('goal', '')
+        desc_part = f" — {desc[:80]}" if desc else ""
+        all_phases_text += f"\n  Phase {pn}: {pname}{desc_part}"
+        checkpoints = phase.get('checkpoints', [])
+        for cp in checkpoints:
+            cp_name = cp.get('name', '')
+            reqs = cp.get('requirements', [])
+            for req in reqs:
+                req_text = req.get('text', '') if isinstance(req, dict) else str(req)
+                all_phases_text += f"\n    • [{cp_name}] {req_text}"
 
-    current_text = ""
-    if current_phase:
-        current_text = f"Expected phase: {current_phase.get('phase_number')} — {current_phase.get('phase_name', '?')}"
+    detected_text_full = ", ".join(sorted(detected_phases)) if detected_phases else "None yet"
 
-    prompt = f"""Analyze these {chunk_frame_count} sequential frames from the live surgery (outlier resolution mode).
+    prompt = f"""Analyze this video chunk from the live surgery (outlier resolution mode).
 
-CURRENT STATE:
-- Suggested phase (hint only): {current_text if current_text else "No specific phase expected"}
-- Detected phases so far: {detected_text}
+ALL PHASES TO DETECT:{all_phases_text}
 
-REMAINING PHASES:{remaining_text}
+ALREADY DETECTED PHASES: {detected_text_full}
 """
     if chunk_history_summary:
-        prompt += f"\nRECENT HISTORY:\n{chunk_history_summary}\n"
+        prompt += f"\nRECENT CHUNK HISTORY:\n{chunk_history_summary}\n"
 
     prompt += """
-Fill the JSON schema based on what you observe in the frames:
-- detected_phase_number: phase number (e.g. "3.1") you can visually identify. null if camera is away, frames are unclear, or nothing surgical is happening.
-- action_observed: describe what is ACTUALLY visible — including "camera pointed away", "nothing visible", "surgeon repositioning" etc.
-- matches_expected: true only if observed phase matches the suggested phase above.
-- step_progress: "in-progress" unless you have definitive visual proof of completion. When a phase is in-progress, validate its checkpoints.
-- checkpoint_validations: for the DETECTED phase (if any), validate each checkpoint requirement you can see. A checkpoint is MET when you visually confirm it. NOT_MET when you can see it is not satisfied. Only include checkpoints you can assess from the frames.
-- error_codes: only report codes you can visually confirm from the frames. Do not flag based on assumptions.
-- completion_evidence: specific visual proof if step_progress is "completed". null otherwise.
+YOUR TASK:
+1. Compare the video against ALL phases above and find the ONE phase most clearly being performed.
+2. Assign a confidence_score (0-100):
+   - 90-100: unmistakable visual evidence matching the phase and its checkpoints
+   - 70-89: strong visual match — activity clearly consistent with this phase
+   - 50-69: ambiguous — some similarity but not conclusive
+   - 0-49: no clear surgical activity, wrong angle, or cannot determine
+3. If confidence_score < 70, set detected_phase_number to null — do not guess.
+4. confidence_reason: briefly state what visual evidence supports or reduces your confidence.
+5. For the DETECTED phase, validate each checkpoint requirement you can observe:
+   - MET: visually confirmed the requirement is satisfied in this video
+   - NOT_MET: can see it is NOT satisfied
+   - Only include checkpoints you can actually assess from the video
+6. error_codes: only flag codes you can visually confirm. Do not assume.
+
+Fill the JSON schema:
+- observation: one factual sentence describing the current surgical field.
+- significant_change: true if scene meaningfully differs from previous chunk. false if same.
+- detected_phase_number: phase number with >= 70 confidence. null if uncertain.
+- confidence_score: 0-100 integer.
+- confidence_reason: brief visual evidence explanation.
+- matches_expected: set true if the detected phase matches any UNDETECTED phase (order doesn't matter).
+- step_progress: "in-progress" unless you see definitive completion evidence.
+- completion_evidence: specific visual proof if completed. null otherwise.
+- action_observed: exactly what is visible — instruments, anatomy, surgeon action.
+- checkpoint_validations: for detected phase only, one entry per assessable checkpoint requirement.
+- error_codes: only visually confirmed codes.
 """
     return prompt
 

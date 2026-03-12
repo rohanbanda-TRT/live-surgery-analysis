@@ -72,6 +72,31 @@ class StandardChunkAnalysis(BaseModel):
         default=False,
         description="True if surgeon is repeating a previously completed step"
     )
+    confidence_score: int = Field(
+        default=0,
+        description=(
+            "Confidence percentage (0-100) that detected_step_number is correct. "
+            "90-100: unmistakable visual evidence. 70-89: strong match. "
+            "50-69: ambiguous. 0-49: unclear or no surgical activity. "
+            "Set detected_step_number to null if confidence < 70."
+        )
+    )
+    confidence_reason: str = Field(
+        default="",
+        description="Brief reason explaining the confidence score — what specific visual evidence supports or reduces confidence"
+    )
+    significant_change: bool = Field(
+        default=True,
+        description=(
+            "True if this chunk shows a meaningfully different surgical state vs the previous chunk "
+            "(new step started, visible progress, instrument change, different phase). "
+            "False if the scene looks essentially the same as before (surgeon repositioning, "
+            "camera still, no new action). Set False to skip redundant processing."
+        )
+    )
+    observation: str = Field(
+        description="One-sentence factual observation of the current surgical field state"
+    )
     analysis_summary: str = Field(
         description="Brief summary of what is happening in the surgical field"
     )
@@ -127,6 +152,30 @@ class OutlierChunkAnalysis(BaseModel):
     error_codes: List[DetectedError] = Field(
         default_factory=list,
         description="Surgical error codes detected (A1-A10, C1-C6, R1-R3)"
+    )
+    confidence_score: int = Field(
+        default=0,
+        description=(
+            "Confidence percentage (0-100) that detected_phase_number is correct. "
+            "90-100: unmistakable visual evidence. 70-89: strong match. "
+            "50-69: ambiguous. 0-49: unclear or no surgical activity. "
+            "Set detected_phase_number to null if confidence < 70."
+        )
+    )
+    confidence_reason: str = Field(
+        default="",
+        description="Brief reason explaining the confidence score — what specific visual evidence supports or reduces confidence"
+    )
+    significant_change: bool = Field(
+        default=True,
+        description=(
+            "True if this chunk shows a meaningfully different surgical state vs the previous chunk "
+            "(new phase started, checkpoint completed, error detected, instrument change). "
+            "False if the scene looks essentially the same as before. Set False to skip redundant processing."
+        )
+    )
+    observation: str = Field(
+        description="One-sentence factual observation of the current surgical field state"
     )
     analysis_summary: str = Field(
         description="Brief summary of what is happening in the surgical field"
