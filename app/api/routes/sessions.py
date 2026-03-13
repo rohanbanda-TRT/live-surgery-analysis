@@ -12,6 +12,9 @@ from app.schemas.procedure import LiveSessionCreate, LiveSessionResponse, Sessio
 from app.services.live_surgery import LiveSurgeryService
 from app.services.live_surgery_outlier_comparison import LiveSurgeryOutlierComparisonService
 from app.core.logging import logger
+from datetime import datetime
+import asyncio
+import json
 
 router = APIRouter()
 
@@ -32,6 +35,9 @@ async def websocket_endpoint(
     Supports multiple analysis modes:
     - V1 (default): Standard live surgery analysis
     - outlier_comparison: Uses chunked video comparison analysis approach
+    
+    Reconnect support: service survives disconnects, only stops on explicit stop.
+    Keepalive: inline timeout on receive loop sends ping to prevent proxy timeouts.
     """
     await websocket.accept()
     logger.info("websocket_connected", session_id=session_id)
@@ -83,19 +89,41 @@ async def websocket_endpoint(
         
         # Define callbacks bound to this WebSocket connection
         async def send_alerts(alerts):
-            await websocket.send_json({
-                "type": "alerts",
-                "data": alerts
-            })
+            try:
+                await websocket.send_json({
+                    "type": "alerts",
+                    "data": alerts
+                })
+            except RuntimeError as e:
+                if "close message has been sent" in str(e):
+                    # WebSocket closed — immediately null callbacks so no further
+                    # chunks waste time trying to send on a dead socket
+                    service.analysis_callback = None
+                    service.alert_callback = None
+                    logger.info("callbacks_nullified_on_send_failure", session_id=session_id)
+                else:
+                    raise
         
         async def send_analysis_update(analysis_data):
-            await websocket.send_json({
-                "type": "analysis_update",
-                "data": analysis_data
-            })
+            try:
+                await websocket.send_json({
+                    "type": "analysis_update",
+                    "data": analysis_data
+                })
+            except RuntimeError as e:
+                if "close message has been sent" in str(e):
+                    # WebSocket closed — immediately null callbacks so no further
+                    # chunks waste time trying to send on a dead socket.
+                    # On reconnect, session_started message restores full cumulative state.
+                    service.analysis_callback = None
+                    service.alert_callback = None
+                    logger.info("callbacks_nullified_on_send_failure", session_id=session_id)
+                else:
+                    raise
         
         if is_reconnect:
-            # Swap callbacks to new WebSocket — service keeps running uninterrupted
+            # Swap callbacks to new WebSocket — service keeps running uninterrupted.
+            # Full cumulative state is restored to frontend via session_started below.
             service.analysis_callback = send_analysis_update
             service.alert_callback = send_alerts
             logger.info("callbacks_updated_on_reconnect", session_id=session_id)
@@ -186,9 +214,20 @@ async def websocket_endpoint(
         })
         
         # Process incoming video frames
+        # Keepalive: use a timeout on receive so we can send a ping inline
+        # (avoids a concurrent background task that could race with sends)
+        KEEPALIVE_INTERVAL = 25  # seconds
         while True:
             try:
-                message = await websocket.receive()
+                try:
+                    message = await asyncio.wait_for(
+                        websocket.receive(), timeout=KEEPALIVE_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    # No frame received for KEEPALIVE_INTERVAL seconds — send ping
+                    # to prevent proxy/load-balancer timeout-based disconnects
+                    await websocket.send_json({"type": "ping"})
+                    continue
                 
                 # Check if connection was closed
                 if message.get("type") == "websocket.disconnect":
@@ -200,7 +239,6 @@ async def websocket_endpoint(
                     await service.process_frame(message["bytes"])
                 elif "text" in message:
                     # Control message
-                    import json
                     data = json.loads(message["text"])
                     
                     if data.get("type") == "stop":
@@ -232,8 +270,8 @@ async def websocket_endpoint(
             service.analysis_callback = None
             service.alert_callback = None
     finally:
-        # Only fully stop service when user sends explicit stop or on clean close
-        # (not on raw WebSocket disconnect, which may be a transient reconnect)
+        # Service stays alive in registry for potential reconnect.
+        # Only removed on explicit stop message (handled above).
         pass
 
 

@@ -145,35 +145,45 @@ function LiveMonitoringPage() {
             setAllSteps(initialSteps);
           }
           addMessage('success', `Session started: ${data.data.procedure_name}`);
+        } else if (data.type === 'ping') {
+          // Keepalive ping from server — no action needed, just prevents timeout
+          return;
         } else if (data.type === 'alerts') {
           setAlerts(prev => [...prev, ...data.data]);
           addMessage('warning', `Alert received: ${data.data.length} new alerts`);
         } else if (data.type === 'analysis_update') {
-          console.log('[LiveMonitoring] Analysis update received:', {
-            procedure_source: data.data.procedure_source,
-            frame_count: data.data.frame_count,
-            all_steps_count: data.data.all_steps?.length,
-            first_step_sample: data.data.all_steps?.[0],
-            full_data: data.data
-          });
-          
+          // Repeat chunk: same surgical state as previous — only update frame counter
+          // and analysis text. Never touch allSteps so the step tracker stays intact.
+          if (data.data.is_repeat) {
+            setCurrentAnalysis(prev => prev ? {
+              ...prev,
+              frame_count: data.data.frame_count,
+              analysis_text: data.data.analysis_text
+            } : prev);
+            return;
+          }
+
           setCurrentAnalysis(data.data);
           setAnalysisHistory(prev => [...prev.slice(-9), data.data]);
           
-          // Update all steps with latest status
+          // Update all steps — merge incoming into existing to preserve detections
           if (data.data.all_steps) {
-            console.log('[LiveMonitoring] Setting all steps:', {
-              count: data.data.all_steps.length,
-              steps: data.data.all_steps.map((s, i) => ({
-                index: i,
-                phase_number: s.phase_number,
-                phase_name: s.phase_name,
-                step_name: s.step_name,
-                status: s.status,
-                has_checkpoints: s.checkpoints?.length > 0
-              }))
+            setAllSteps(prev => {
+              if (!prev || prev.length === 0) return data.data.all_steps;
+              // Merge: keep a step as detected/completed/current if EITHER old or new says so
+              return data.data.all_steps.map((incoming, i) => {
+                const existing = prev[i];
+                if (!existing) return incoming;
+                const wasDetected = existing.detected || incoming.detected;
+                const bestStatus = (() => {
+                  const rank = { completed: 3, current: 2, pending: 1 };
+                  const a = rank[existing.status] ?? 0;
+                  const b = rank[incoming.status] ?? 0;
+                  return a >= b ? existing.status : incoming.status;
+                })();
+                return { ...incoming, detected: wasDetected, status: bestStatus };
+              });
             });
-            setAllSteps(data.data.all_steps);
           }
           addMessage('info', `Analysis: Frame ${data.data.frame_count} - ${data.data.current_step_name}`);
         }
