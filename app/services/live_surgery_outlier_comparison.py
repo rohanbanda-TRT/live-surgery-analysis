@@ -44,34 +44,37 @@ def _format_timestamp(seconds: float) -> str:
 
 def _build_chunk_history_text(previous_analyses: List[Dict[str, Any]]) -> str:
     """
-    Build a complete rolling history string from ALL previous chunk analyses.
-    Includes chunk time range, detected phases, and full analysis text.
-    NO truncation - user requested ALL past chunk details.
+    Build rolling history for the prompt from all unique (non-repeat) chunks.
+
+    - Repeat chunks (is_repeat=True) are excluded — they add no new information.
+    - Every other chunk is included in full so the AI has complete context.
+    - A detected-phases summary is prepended for quick orientation.
     """
     if not previous_analyses:
         return ""
 
+    unique_chunks = [p for p in previous_analyses if not p.get("is_repeat", False)]
+    if not unique_chunks:
+        return ""
+
     parts = []
-    detected_phases_summary = []
-    
-    for prev in previous_analyses:
-        time_range = prev.get("time_range", "")
-        analysis = prev.get("analysis", "")
-        detected_phase = prev.get("detected_phase")
-        
-        # Track detected phases for summary
-        if detected_phase:
-            detected_phases_summary.append(f"Phase {detected_phase} (Chunk {prev['chunk_index'] + 1})")
-        
-        # Include full analysis text (no truncation as requested)
-        parts.append(f"=== Chunk {prev['chunk_index'] + 1} ({time_range}) ===\n{analysis}")
-    
-    # Add detected phases summary at the beginning
-    if detected_phases_summary:
-        summary = "**DETECTED PHASES ACROSS ALL CHUNKS:**\n" + ", ".join(detected_phases_summary) + "\n\n"
-        return summary + "\n\n".join(parts)
-    
-    return "\n\n".join(parts)
+    detected_summary = []
+
+    for prev in unique_chunks:
+        if prev.get("detected_phase"):
+            detected_summary.append(
+                f"Phase {prev['detected_phase']} (Chunk {prev['chunk_index'] + 1})"
+            )
+        parts.append(
+            f"=== Chunk {prev['chunk_index'] + 1} ({prev.get('time_range', '')}) ==="
+            f"\n{prev.get('analysis', '')}"
+        )
+
+    header = ""
+    if detected_summary:
+        header = "**DETECTED PHASES ACROSS ALL CHUNKS:**\n" + ", ".join(detected_summary) + "\n\n"
+
+    return header + "\n\n".join(parts)
 
 
 class LiveSurgeryOutlierComparisonService:
@@ -120,11 +123,31 @@ class LiveSurgeryOutlierComparisonService:
         # Video chunk processing
         self.frame_buffer: List[bytes] = []
         self.frame_count: int = 0
-        self.chunk_size: int = 5  # 5 seconds at 1 FPS (configurable)
-        self.chunk_overlap: int = 1  # 1 second overlap
+        self.chunk_size: int = 5  # frames at 1 FPS
+        self.chunk_overlap: int = 1
         self.chunk_queue: asyncio.Queue = asyncio.Queue()
         self.is_processing_chunks: bool = False
         self.chunk_task: Optional[asyncio.Task] = None
+
+        # ── Ordered Integrator (LangGraph-style shared state) ─────────────────
+        # Workers run concurrently (up to MAX_CONCURRENT) but results are
+        # applied to shared state IN CHUNK ORDER so that later workers always
+        # start with the most up-to-date history snapshot available.
+        #
+        #  Queue → Dispatcher → Workers 1..N (each snapshots history at start)
+        #                           ↓  post raw result to _result_buffer
+        #                      Ordered Integrator (serial, drains in order 0→1→2…)
+        #                           ↓  appends to chunk_history  ← future workers see this
+        #                      _process_json_analysis_response → cumulative state + callback
+        #
+        self.MAX_CONCURRENT: int = 4
+        self._analysis_semaphore: asyncio.Semaphore = asyncio.Semaphore(self.MAX_CONCURRENT)
+        # slot index → raw result dict; filled by workers as they complete
+        self._result_buffer: Dict[int, Dict[str, Any]] = {}
+        # next chunk index the integrator should process (in-order)
+        self._next_integrate_index: int = 0
+        # prevents two coroutines from running the integrator simultaneously
+        self._integration_lock: asyncio.Lock = asyncio.Lock()
         
         logger.info("live_surgery_outlier_comparison_initialized", session_id=session_id)
     
@@ -304,16 +327,28 @@ class LiveSurgeryOutlierComparisonService:
             )
     
     async def _process_chunk_queue(self):
-        """Background task to process video chunks from queue."""
+        """
+        Background task to dispatch video chunks for analysis.
+
+        Each chunk is dispatched as an independent asyncio Task protected by
+        _analysis_semaphore (max 2 concurrent Gemini calls).  This keeps us
+        from falling behind real-time when analysis takes longer than the
+        chunk interval.
+        """
+        active_tasks: List[asyncio.Task] = []
+
+        async def _run_chunk(chunk_data: Dict[str, Any]):
+            async with self._analysis_semaphore:
+                await self._analyze_video_chunk(chunk_data)
+
         try:
             while self.is_processing_chunks:
                 try:
-                    # Get next chunk from queue (wait up to 1 second)
                     chunk_data = await asyncio.wait_for(
                         self.chunk_queue.get(),
                         timeout=1.0
                     )
-                    
+
                     logger.info(
                         "processing_chunk_outlier_comparison",
                         session_id=self.session_id,
@@ -322,12 +357,14 @@ class LiveSurgeryOutlierComparisonService:
                         end_frame=chunk_data["end_frame"],
                         queue_remaining=self.chunk_queue.qsize()
                     )
-                    
-                    # Analyze the video chunk
-                    await self._analyze_video_chunk(chunk_data)
-                    
+
+                    task = asyncio.create_task(_run_chunk(chunk_data))
+                    active_tasks.append(task)
+
+                    # Prune completed tasks to avoid memory leak
+                    active_tasks = [t for t in active_tasks if not t.done()]
+
                 except asyncio.TimeoutError:
-                    # No chunks in queue, continue waiting
                     continue
                 except Exception as e:
                     logger.error(
@@ -335,46 +372,49 @@ class LiveSurgeryOutlierComparisonService:
                         session_id=self.session_id,
                         error=str(e)
                     )
-                    
+
         except asyncio.CancelledError:
-            logger.info(
-                "chunk_processing_cancelled_outlier_comparison",
-                session_id=self.session_id
-            )
+            # Wait for in-flight analyses to finish cleanly
+            if active_tasks:
+                await asyncio.gather(*active_tasks, return_exceptions=True)
+            logger.info("chunk_processing_cancelled_outlier_comparison", session_id=self.session_id)
         except Exception as e:
-            logger.error(
-                "chunk_queue_handler_failed_outlier_comparison",
-                session_id=self.session_id,
-                error=str(e)
-            )
+            logger.error("chunk_queue_handler_failed_outlier_comparison", session_id=self.session_id, error=str(e))
     
-    def _create_video_from_frames(self, frames: List[bytes]) -> bytes:
-        """Create a video file from frame images."""
+    async def _create_video_from_frames(self, frames: List[bytes]) -> bytes:
+        """
+        Async video creation from frames using ffmpeg.
+
+        Uses -preset ultrafast for minimal encoding latency.
+        Non-blocking: runs ffmpeg via asyncio subprocess so the event loop
+        is free to dispatch other work while encoding.
+        """
         import tempfile
-        import subprocess
-        
+
         try:
-            # Create temp directory for frames
             with tempfile.TemporaryDirectory() as temp_dir:
-                # Save frames as images
                 for i, frame_data in enumerate(frames):
-                    frame_path = f"{temp_dir}/frame_{i:04d}.jpg"
-                    with open(frame_path, 'wb') as f:
+                    with open(f"{temp_dir}/frame_{i:04d}.jpg", 'wb') as f:
                         f.write(frame_data)
-                
-                # Create video using ffmpeg
+
                 output_path = f"{temp_dir}/chunk.mp4"
-                subprocess.run([
+                proc = await asyncio.create_subprocess_exec(
                     'ffmpeg', '-y',
-                    '-framerate', '1',  # 1 FPS
+                    '-framerate', '1',
                     '-i', f'{temp_dir}/frame_%04d.jpg',
                     '-c:v', 'libx264',
+                    '-preset', 'ultrafast',   # fastest encoding, ~3x faster than default
+                    '-tune', 'zerolatency',   # minimise buffering delay
                     '-pix_fmt', 'yuv420p',
                     '-movflags', '+faststart',
-                    output_path
-                ], check=True, capture_output=True)
-                
-                # Read video file
+                    output_path,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+                await proc.communicate()
+                if proc.returncode != 0:
+                    raise RuntimeError(f"ffmpeg exited with code {proc.returncode}")
+
                 with open(output_path, 'rb') as f:
                     return f.read()
                     
@@ -388,142 +428,204 @@ class LiveSurgeryOutlierComparisonService:
     
     async def _analyze_video_chunk(self, chunk_data: Dict[str, Any]):
         """
-        Analyze a video chunk using outlier comparison approach.
-        
-        Uses same prompts and extraction methods as chunked_video_comparison.py
+        Worker: encode video, snapshot history, call Gemini, post result to buffer.
+
+        Does NOT touch shared state directly — that is the integrator's job.
+        Taking a snapshot of chunk_history at start means this worker automatically
+        gets context from all chunks that were already integrated before it started.
         """
+        chunk_index = chunk_data["chunk_index"]
         try:
-            # Early exit if session is stopped
             if not self.is_processing_chunks:
-                logger.info(
-                    "chunk_skipped_session_stopped_outlier_comparison",
-                    session_id=self.session_id,
-                    chunk_index=chunk_data.get("chunk_index")
-                )
                 return
-            
-            chunk_index = chunk_data["chunk_index"]
+
             start_sec = chunk_data["start_sec"]
-            end_sec = chunk_data["end_sec"]
+            end_sec   = chunk_data["end_sec"]
             time_range = f"{_format_timestamp(start_sec)} – {_format_timestamp(end_sec)}"
-            
-            # Create video from frames
-            video_data = self._create_video_from_frames(chunk_data["frames"])
-            
-            # Build rolling history from all previous chunks
-            history_text = _build_chunk_history_text(self.chunk_history)
-            
-            # Build detected phases summary for AI context
+
+            # ── 1. Encode video (async, non-blocking) ───────────────────────────
+            video_data = await self._create_video_from_frames(chunk_data["frames"])
+
+            # ── 2. Snapshot shared state at this exact moment ───────────────────
+            #    Any chunks integrated BEFORE this worker started are visible here.
+            #    Chunks whose workers are still in-flight are NOT yet visible — that
+            #    is the inherent trade-off of concurrent processing.
+            history_snapshot   = list(self.chunk_history)
+            cumulative_snapshot = set(self.detected_steps_cumulative)
+
+            history_text = _build_chunk_history_text(history_snapshot)
+
+            # Build detected phases info from snapshot
             detected_phases_info = ""
-            if self.procedure_source == "outlier" and self.detected_steps_cumulative:
-                detected_list = []
-                for idx in sorted(self.detected_steps_cumulative):
-                    if idx < len(self.procedure_steps):
-                        phase = self.procedure_steps[idx]
-                        detected_list.append(f"Phase {phase.get('phase_number')}: {phase.get('phase_name')}")
+            if self.procedure_source == "outlier" and cumulative_snapshot:
+                detected_list = [
+                    f"Phase {self.procedure_steps[idx].get('phase_number')}: "
+                    f"{self.procedure_steps[idx].get('phase_name')}"
+                    for idx in sorted(cumulative_snapshot)
+                    if idx < len(self.procedure_steps)
+                ]
                 if detected_list:
-                    detected_phases_info = "\n**PHASES ALREADY MARKED AS DETECTED:**\n" + "\n".join(f"✓ {p}" for p in detected_list) + "\n"
-            
-            # Build prompt based on procedure source (using comparison approach)
+                    detected_phases_info = (
+                        "\n**PHASES ALREADY MARKED AS DETECTED:**\n"
+                        + "\n".join(f"✓ {p}" for p in detected_list)
+                        + "\n"
+                    )
+
+            # ── 3. Build prompt ─────────────────────────────────────────────────
             if self.procedure_source == "outlier":
                 prompt = self._build_outlier_chunk_prompt(
                     chunk_index=chunk_index,
                     start_sec=start_sec,
                     end_sec=end_sec,
                     history_text=history_text,
-                    detected_phases_info=detected_phases_info
+                    detected_phases_info=detected_phases_info,
+                    history_snapshot=history_snapshot,
                 )
             else:
                 prompt = self._build_standard_chunk_prompt(
                     chunk_index=chunk_index,
                     start_sec=start_sec,
                     end_sec=end_sec,
-                    history_text=history_text
+                    history_text=history_text,
                 )
-            
+
             logger.info(
                 "chunk_prompt_built_outlier_comparison",
                 session_id=self.session_id,
                 chunk_index=chunk_index,
                 prompt_length=len(prompt),
-                history_chunks_count=len(self.chunk_history)
+                history_chunks_in_snapshot=len(history_snapshot),
+                concurrent_workers=self.MAX_CONCURRENT - self._analysis_semaphore._value,
             )
-            
-            # Analyze video chunk with Gemini using structured JSON output (no regex parsing needed!)
+
+            # ── 4. Call Gemini ──────────────────────────────────────────────────
             response_schema = (
-                OutlierComparisonChunkAnalysis if self.procedure_source == "outlier"
+                OutlierComparisonChunkAnalysis
+                if self.procedure_source == "outlier"
                 else StandardComparisonChunkAnalysis
             )
-            
+
             analysis_json = await self.gemini_client.analyze_video_chunk(
                 video_data=video_data,
                 prompt=prompt,
-                temperature=0.1,  # Lower temperature = faster, more deterministic responses
-                response_schema=response_schema
+                temperature=0.1,
+                response_schema=response_schema,
             )
-            
-            # Parse JSON response
+
             analysis_data = json.loads(analysis_json)
-            
-            # LOG EXACT JSON RESPONSE FROM GEMINI
+
+            # Log the FULL raw JSON response for debugging
+            logger.info(
+                "gemini_raw_json_response",
+                session_id=self.session_id,
+                chunk_index=chunk_index,
+                raw_json=analysis_json,
+            )
+
             logger.info(
                 "gemini_json_response_received",
                 session_id=self.session_id,
                 chunk_index=chunk_index,
-                json_response=analysis_data,  # Full JSON for debugging
+                is_repeat=analysis_data.get("is_repeat", False),
                 phases_count=len(analysis_data.get("phases", [])),
-                error_codes_count=len(analysis_data.get("error_codes", []))
+                error_codes_count=len(analysis_data.get("error_codes", [])),
             )
-            
-            # Extract analysis text for display and history
-            analysis = analysis_data.get("analysis_text", "")
-            
-            # Store in chunk history for rolling context with detection metadata
-            chunk_record = {
-                "chunk_index": chunk_index,
-                "time_range": time_range,
-                "analysis": analysis,
-                "start_frame": chunk_data["start_frame"],
-                "end_frame": chunk_data["end_frame"],
-                "start_sec": start_sec,
-                "end_sec": end_sec
+
+            # ── 5. Post raw result to ordered buffer, then trigger integrator ───
+            self._result_buffer[chunk_index] = {
+                "analysis_data": analysis_data,
+                "analysis_text": analysis_data.get("analysis_text", ""),
+                "chunk_data":    chunk_data,
+                "time_range":    time_range,
+                "is_repeat":     analysis_data.get("is_repeat", False),
             }
-            
-            # Add detection metadata from JSON (no regex parsing!)
-            if self.procedure_source == "outlier":
-                # Extract detected phases from JSON
-                phases = analysis_data.get("phases", [])
-                for phase in phases:
-                    if phase.get("detected"):
-                        detected_phase_number = phase.get("phase_number")
-                        if detected_phase_number:
-                            chunk_record["detected_phase"] = detected_phase_number
-                            chunk_record["detected_phase_index"] = self.phase_number_to_index.get(detected_phase_number)
-                            break  # Only track first detected phase per chunk
-            
-            self.chunk_history.append(chunk_record)
-            
-            # Keep ALL chunks - no limit (user requested full history for better context)
-            
-            logger.info(
-                "chunk_analyzed_outlier_comparison",
-                session_id=self.session_id,
-                chunk_index=chunk_index,
-                time_range=time_range,
-                frames=len(chunk_data["frames"]),
-                history_size=len(self.chunk_history),
-                structured_json=True
-            )
-            
-            # Parse and process JSON response (no regex!)
-            await self._process_json_analysis_response(analysis_data, analysis, chunk_data)
-            
+
+            # Trigger integrator — it will drain whatever is ready in order
+            await self._integrate_pending_results()
+
         except Exception as e:
             logger.error(
                 "chunk_analysis_failed_outlier_comparison",
                 session_id=self.session_id,
-                error=str(e)
+                chunk_index=chunk_index,
+                error=str(e),
+                traceback=traceback.format_exc(),
             )
+            # Post a sentinel so the integrator doesn't stall on this slot
+            self._result_buffer[chunk_index] = None  # type: ignore
+            await self._integrate_pending_results()
+
+    async def _integrate_pending_results(self):
+        """
+        Ordered integrator — the LangGraph-style state manager.
+
+        Drains _result_buffer starting from _next_integrate_index, processing
+        consecutive completed slots in sequence.  Serialised by _integration_lock
+        so only one coroutine runs this at a time.
+
+        After each result is integrated:
+        - chunk_history is updated (future workers' snapshots see it)
+        - cumulative detection state is updated
+        - analysis_callback is fired
+        """
+        async with self._integration_lock:
+            while self._next_integrate_index in self._result_buffer:
+                idx    = self._next_integrate_index
+                result = self._result_buffer.pop(idx)
+                self._next_integrate_index += 1
+
+                if result is None:
+                    # Worker failed for this slot — skip but keep order intact
+                    logger.warning(
+                        "integrator_skipping_failed_chunk",
+                        session_id=self.session_id,
+                        chunk_index=idx,
+                    )
+                    continue
+
+                analysis_data = result["analysis_data"]
+                analysis_text = result["analysis_text"]
+                chunk_data    = result["chunk_data"]
+                time_range    = result["time_range"]
+                is_repeat     = result["is_repeat"]
+
+                # Build chunk_record and append to shared history
+                chunk_record = {
+                    "chunk_index": idx,
+                    "time_range":  time_range,
+                    "analysis":    analysis_text,
+                    "is_repeat":   is_repeat,
+                    "start_frame": chunk_data["start_frame"],
+                    "end_frame":   chunk_data["end_frame"],
+                    "start_sec":   chunk_data["start_sec"],
+                    "end_sec":     chunk_data["end_sec"],
+                }
+                if self.procedure_source == "outlier":
+                    for phase in analysis_data.get("phases", []):
+                        if phase.get("detected") and phase.get("phase_number"):
+                            chunk_record["detected_phase"]       = phase["phase_number"]
+                            chunk_record["detected_phase_index"] = self.phase_number_to_index.get(phase["phase_number"])
+                            break
+
+                # Append BEFORE processing so next worker snapshot includes it
+                self.chunk_history.append(chunk_record)
+
+                unique_count = sum(1 for c in self.chunk_history if not c.get("is_repeat"))
+                logger.info(
+                    "chunk_integrated",
+                    session_id=self.session_id,
+                    chunk_index=idx,
+                    is_repeat=is_repeat,
+                    history_size=len(self.chunk_history),
+                    unique_in_history=unique_count,
+                    buffer_pending=len(self._result_buffer),
+                    next_integrate=self._next_integrate_index,
+                )
+
+                # Apply state update and fire callback
+                await self._process_json_analysis_response(
+                    analysis_data, analysis_text, chunk_data, is_repeat=is_repeat
+                )
     
     def _build_standard_chunk_prompt(
         self,
@@ -616,13 +718,23 @@ After analyzing all visible steps, provide:
         start_sec: float,
         end_sec: float,
         history_text: str,
-        detected_phases_info: str = ""
+        detected_phases_info: str = "",
+        history_snapshot: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Build prompt for a chunk in outlier mode (comparison approach)."""
-        procedure_name = self.outlier_procedure.get("procedure_name", "Unknown Procedure")
         time_range = f"{_format_timestamp(start_sec)} – {_format_timestamp(end_sec)}"
         phases_context = build_outlier_resolution_context(self.outlier_procedure)
-        
+
+        # Use the snapshot passed by the worker (reflects state at worker start time)
+        snapshot = history_snapshot if history_snapshot is not None else self.chunk_history
+        last_unique = next(
+            (c for c in reversed(snapshot) if not c.get("is_repeat")), None
+        )
+        last_phase_hint = (
+            f" Last unique chunk showed Phase {last_unique['detected_phase']}."
+            if last_unique and last_unique.get("detected_phase") else ""
+        )
+
         prompt = f"""You are analyzing CHUNK {chunk_index + 1} from a LIVE surgical video using the Outlier Resolution Protocol.
 
 **VIDEO SEGMENT:**
@@ -636,7 +748,7 @@ After analyzing all visible steps, provide:
 {phases_context}
 {detected_phases_info}
 """
-        
+
         if history_text:
             prompt += f"""
 **ANALYSIS FROM PREVIOUS CHUNKS:**
@@ -652,59 +764,58 @@ The following is the complete analysis from ALL prior chunks. Use this context t
             prompt += """
 **NOTE:** This is the FIRST chunk — no prior analysis history is available.
 """
-        
+
         prompt += f"""
 **YOUR TASK:**
 Analyze this video segment ({time_range}) and return a structured JSON response with:
 1. Which phases are visible in this chunk
 2. Which checkpoints can be validated
-3. Which error codes (A1-A10, C1-C6, R1-R3) are detected
+3. Which error codes are detected (if any)
 
-**CRITICAL: You MUST respond with valid JSON matching the provided schema.**
+**is_repeat rule:** If the surgical state is IDENTICAL to the previous chunk (same phase on screen, same text overlays, no new instrument actions visible), set is_repeat=true and provide a single-sentence analysis_text.{last_phase_hint}
 
-The JSON response should include:
-- "phases": Array of phase objects with detected status, evidence, timestamps, and checkpoint_validations
-- "error_codes": Array of detected error codes with severity
-- "chunk_summary": Summary statistics for this chunk
-- "analysis_text": Natural language summary for display to the surgeon
+**When is_repeat=false (state has changed or first chunk):**
 
-For each phase detected, include checkpoint_validations array with:
+For each DETECTED phase, include checkpoint_validations array with:
 - checkpoint_name: Name of the checkpoint requirement
 - status: "MET", "NOT_MET", or "PREVIOUSLY_MET"
 - evidence: Visual evidence from the video
 
-**EXAMPLE STRUCTURE (you must follow this):**
+**ERROR CODE DETECTION (CRITICAL):**
+Carefully examine the video for surgical errors. Report ANY observed errors using these codes:
 
-Phase [number]: [name]
-Detected: [YES/NO]
-Evidence: [specific visual evidence from this video segment]
-Timestamp: [time range in the surgery]
+**Action Errors (A-series):**
+- **A1**: Action too long or too short (e.g., premature cannula removal, excessive drilling time)
+- **A3**: Wrong direction (e.g., poor cannula bevel orientation, opening ligament laterally instead of medially, wrong endoscope rotation)
+- **A4**: Too little or too much (e.g., insufficient drilling, incomplete tissue resection, excessive annulus opening, rough manipulation)
+- **A5**: Misalignment (e.g., wrong level/side approach, incorrect target positioning)
+- **A8**: Operation omitted (e.g., skipping vessel coagulation, not performing annuloplasty, omitting verification checks)
+- **A9**: Wrong object (e.g., missing anatomical landmarks, incorrect structure identification)
+- **A10**: Other action errors
 
-**CHECKPOINT VALIDATION:**
-For each checkpoint in this phase:
-- [Checkpoint name]: [MET/NOT MET/PREVIOUSLY_MET] - [Evidence]
+**Checking Errors (C-series):**
+- **C1**: Check omitted (e.g., no fluoroscopy confirmation, skipping imaging verification - HIGH RISK for wrong-site surgery)
+- **C2-C6**: Other checking errors
 
-**ERROR CODES DETECTED:**
-- [List any error codes observed in this chunk]
+**Retrieval Errors (R-series):**
+- **R2**: Wrong information obtained (e.g., misidentified anatomy, incorrect level counting)
+- **R1, R3**: Other retrieval errors
 
-**PHASE COMPLETION:**
-- Status: [COMPLETED/PARTIAL/NOT_PERFORMED]
-- Blocking Issues: [Any blocking checkpoints not met]
+**How to detect errors:**
+- Look for VISIBLE deviations from proper technique (instruments in wrong position, skipped steps, rough handling)
+- Check if critical safety steps are being performed (coagulation before cutting, fluoroscopy checks, gentle tissue handling)
+- Identify if anatomical landmarks are being properly identified before proceeding
+- Watch for signs of bleeding, tissue damage, or instrument misplacement
 
----
+**For each detected error, provide:**
+- code: The error code (e.g., "A8", "C1", "A4")
+- description: What specific error you observed
+- severity: "HIGH" (neural injury risk, wrong-site, dural tear), "MEDIUM" (bleeding, incomplete resection), or "LOW" (minor technique issues)
+- phase: Which phase number the error occurred in
 
-After analyzing all visible phases, provide:
+**IMPORTANT:** Only report errors you can VISUALLY CONFIRM in the video. Do not assume errors - if the video quality is unclear or the step is not visible, do not report an error for that step.
 
-**CHUNK SUMMARY:**
-- Chunk: {chunk_index + 1}
-- Time Window: {time_range}
-- Phases Detected: [number]
-- Phases Completed: [number]
-- Checkpoints Met: [number]
-- Error Codes: [list]
-
-**CRITICAL SAFETY ISSUES:**
-[List any HIGH priority errors or safety concerns in this chunk]
+**CRITICAL: You MUST respond with valid JSON matching the provided schema exactly.**
 """
         return prompt
     
@@ -712,12 +823,15 @@ After analyzing all visible phases, provide:
         self,
         analysis_data: Dict[str, Any],
         analysis_text: str,
-        chunk_data: Dict[str, Any]
+        chunk_data: Dict[str, Any],
+        is_repeat: bool = False
     ):
         """
         Process JSON analysis response and update UI.
         GUARANTEE: analysis_callback is ALWAYS called regardless of parsing errors.
         Each risky step is isolated so one failure cannot kill the callback.
+        When is_repeat=True: cumulative state/checkpoints still update, but
+        the all_steps rebuild is skipped for efficiency.
         """
         chunk_index = chunk_data.get("chunk_index", -1)
         detected_phases_in_chunk = []
@@ -769,7 +883,8 @@ After analyzing all visible phases, provide:
                     detected_phases=detected_phases_in_chunk,
                     checkpoint_status=checkpoint_status["status"],
                     checkpoint_count=len(checkpoint_status["details"]),
-                    error_count=len(error_codes)
+                    error_count=len(error_codes),
+                    error_codes_detail=[{"code": e.get("code"), "severity": e.get("severity")} for e in error_codes]
                 )
             else:
                 for step in analysis_data.get("steps", []):
@@ -881,6 +996,28 @@ After analyzing all visible phases, provide:
         if not self.analysis_callback:
             return
 
+        # On repeat chunks: skip the expensive all_steps rebuild.
+        # Just send a lightweight heartbeat so the frontend knows we're alive.
+        if is_repeat:
+            if self.analysis_callback:
+                try:
+                    await self.analysis_callback({
+                        "frame_count": chunk_data.get("end_frame", 0),
+                        "is_repeat": True,
+                        "analysis_text": analysis_text,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                except RuntimeError as e:
+                    if "close message has been sent" in str(e):
+                        logger.info(
+                            "repeat_heartbeat_skipped_websocket_closed",
+                            session_id=self.session_id,
+                            chunk_index=chunk_data.get("chunk_index", -1)
+                        )
+                except Exception:
+                    pass
+            return
+
         try:
             next_undetected_index = next(
                 (i for i in range(len(self.procedure_steps)) if i not in self.detected_steps_cumulative),
@@ -964,10 +1101,38 @@ After analyzing all visible phases, provide:
                 "all_steps": all_steps_data,
                 "analysis_text": analysis_text,
                 "checkpoint_status": checkpoint_status,
+                "error_codes": error_codes,  # Add error codes at top level for frontend
                 "timestamp": datetime.utcnow().isoformat()
             }
 
-            await self.analysis_callback(msg)
+            # Log what's being sent to frontend for debugging
+            logger.info(
+                "frontend_message_prepared",
+                session_id=self.session_id,
+                chunk_index=chunk_index,
+                error_codes_in_message=len(error_codes),
+                error_codes_detail=[{"code": e.get("code"), "severity": e.get("severity"), "phase": e.get("phase")} for e in error_codes],
+                steps_with_errors=[i for i, s in enumerate(all_steps_data) if s.get("detected_errors")]
+            )
+
+            # Defensive callback invocation: check again right before calling
+            # (callback could have been nullified by disconnect handler between
+            # the check at line 959 and here due to race condition)
+            if self.analysis_callback:
+                try:
+                    await self.analysis_callback(msg)
+                except RuntimeError as e:
+                    # WebSocket closed between check and send — this is expected
+                    # during reconnects. Service stays alive, callback will be
+                    # restored on reconnect.
+                    if "close message has been sent" in str(e):
+                        logger.info(
+                            "callback_skipped_websocket_closed",
+                            session_id=self.session_id,
+                            chunk_index=chunk_index
+                        )
+                    else:
+                        raise
 
         except Exception as e:
             logger.error(
